@@ -1,5 +1,6 @@
 #include <time.h>
 #include <sys/stat.h>
+#include <stdint.h> // Include this header for uint8_t
 
 #define BLOCK_SIZE (512)
 #define MAX_NAME   (28)
@@ -31,6 +32,9 @@ struct wfs_sb {
     off_t d_bitmap_ptr;
     off_t i_blocks_ptr;
     off_t d_blocks_ptr;
+
+    uint8_t raid_mode;   // 0 = RAID 0, 1 = RAID 1, 2 = RAID 1v
+    uint8_t num_disks;   // Number of disks
     // Extend after this line
 };
 
