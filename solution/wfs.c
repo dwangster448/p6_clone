@@ -13,37 +13,22 @@
 #include <sys/stat.h>
 #include "wfs.h" // Ensure wfs.h is included for super_block reads
 
-#define MAX_DISKS 3
 #define MAX_PATH_LEN 10
 #define MAX_NAME_LEN 26
-#define ENTRIES_PER_BLOCK (BLOCK_SIZE / sizeof(struct wfs_dentry))
-
-#define MAX_FILE_SIZE (26)
-#define DIRECTORY_TYPE (S_IFDIR) // Or use S_IFDIR directly
-// #define MAX_FILE_SIZE (BLOCK_SIZE * 1)
 #define ROOT_INODE_NUM 0 // Assuming the root inode is 0, adjust based on your design
 
-// // Declare global variables
-// extern struct wfs_sb superblock;
-// extern FILE *disks[];
-// extern uint8_t raid_mode;
-// extern size_t num_disks;
-
-// Global variable for RAID mode
-// int raid_mode = -1; // Default to -1, meaning no RAID mode
+#define MAX_DISKS (10)
 
 // Global variables
 int raid_mode = -1;
-// char *disk_paths[MAX_DISKS];
 int num_disks;
 uint8_t *inode_bitmap;
 uint8_t *data_bitmap;
-//struct wfs_inode *inode_table;
 void **disk_mappings;
-struct wfs_sb *superblock;
+struct wfs_sb *superblock = NULL;
 int disk_count = 0;
 char *disks[MAX_DISKS] = {NULL, NULL, NULL};
-// int disks[MAX_DISKS]; // Declare disks as file descriptors
+size_t disk_size = 1024 * 1024;
 
 char *mount_point = NULL;
 
@@ -51,7 +36,15 @@ static int disk_fd = -1;               // Disk file descriptor
 static struct wfs_sb sb;               // Superblock
 static int disk_fds[MAX_DISKS] = {-1}; // Array to hold file descriptors for each disk
 
+void *disk;
+
 // Helper functions prototypes
+int wfs_getattr(const char *path, struct stat *stbuf);
+int wfs_mknod(const char *path, mode_t mode, dev_t dev);
+int wfs_mkdir(const char *path, mode_t mode);
+int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi);
+
+int parse_arguments(int argc, char *argv[], char *disks[], int *disk_count, char **mount_point, char *fuse_argv[], int *fuse_argc);
 int initialize_raid(int raid_mode, char *disks[], int disk_count);
 int retrieve_raid_mode(const char *disk_path);
 int prepare_fuse_args(int argc, char *argv[], int disk_count, char *fuse_argv[], int *fuse_argc);
@@ -62,12 +55,12 @@ int allocate_root_inode();
 int set_bit_root(off_t bitmap_ptr, int bit, int disk_fd);
 int find_free_bit_root(off_t bitmap_ptr, size_t count, int disk_fd);
 
-int allocate_inode(struct wfs_inode *inode, uint16_t mode);
+int allocate_inode(struct wfs_sb *sb);
 int find_free_data_block();
 void free_inode(int inode_number);
 void free_data_block(int block_number);
 
-int resolve_path_to_inode(const char *path, struct wfs_inode *inode);
+int resolve_path_to_inode(const char *path);
 int wfs_lookup(const char *path);
 struct wfs_inode *wfs_get_inode(int inode_num);
 int wfs_get_parent_inode(const char *path);
@@ -88,146 +81,18 @@ int read_inode(int inode_num, struct wfs_inode *inode);
 off_t calculate_block_offset(int block_num);
 int read_data_block(off_t block_offset, void *buffer, size_t size);
 
+int add_directory_entry(struct wfs_inode *parent_inode, int parent_inode_num, int new_inode_num, const char *entry_name);
+void write_inode(struct wfs_sb *sb, struct wfs_inode *inode);
+int write_data_block(off_t block_offset, const void *data, size_t size);
+int allocate_free_data_block();
+int allocate_free_inode();
+
 static inline int max(int a, int b)
 {
     return (a > b) ? a : b;
 }
 
-int allocate_root_inode()
-{
-    printf("[DEBUG] Entering allocate_root_inode()\n");
-
-    // Step 1: Read the superblock
-    printf("[DEBUG] Reading superblock from disk 0 (file descriptor: %d)\n", disk_fds[0]);
-    struct wfs_sb sb;
-    if (pread(disk_fds[0], &sb, sizeof(sb), 0) != sizeof(sb))
-    {
-        perror("[ERROR] Failed to read superblock");
-        return -EIO;
-    }
-    printf("[DEBUG] Superblock read successfully. Number of inodes: %zu\n", sb.num_inodes);
-
-    // Step 2: Locate a free inode
-    int root_inode_num = find_free_bit_root(sb.i_bitmap_ptr, sb.num_inodes, disk_fds[0]);
-    if (root_inode_num < 0)
-    {
-        printf("[ERROR] No free inodes available\n");
-        return -ENOSPC; // No space left
-    }
-    printf("[DEBUG] Found free inode at index: %d\n", root_inode_num);
-
-    // Step 3: Mark inode as allocated
-    if (set_bit_root(sb.i_bitmap_ptr, root_inode_num, disk_fds[0]) != 0)
-    {
-        printf("[ERROR] Failed to set inode bitmap for inode: %d\n", root_inode_num);
-        return -EIO;
-    }
-    printf("[DEBUG] Inode bitmap updated. Inode %d marked as allocated.\n", root_inode_num);
-
-    // Step 4: Allocate data block for directory entries
-    int data_block_num = find_free_bit_root(sb.d_bitmap_ptr, sb.num_data_blocks, disk_fds[0]);
-    if (data_block_num < 0)
-    {
-        printf("[ERROR] No free data blocks available\n");
-        return -ENOSPC;
-    }
-    printf("[DEBUG] Found free data block at index: %d\n", data_block_num);
-
-    if (set_bit_root(sb.d_bitmap_ptr, data_block_num, disk_fds[0]) != 0)
-    {
-        printf("[ERROR] Failed to set data block bitmap for block: %d\n", data_block_num);
-        return -EIO;
-    }
-    printf("[DEBUG] Data block bitmap updated. Block %d marked as allocated.\n", data_block_num);
-
-    // Step 5: Initialize the root inode
-    struct wfs_inode root_inode = {0};
-    root_inode.num = root_inode_num;
-    root_inode.mode = S_IFDIR | 0755;
-    root_inode.uid = 0; // Root user
-    root_inode.gid = 0; // Root group
-    root_inode.size = BLOCK_SIZE;
-    root_inode.nlinks = 2; // "." and ".."
-    root_inode.atim = root_inode.mtim = root_inode.ctim = time(NULL);
-    root_inode.blocks[0] = sb.d_blocks_ptr + (data_block_num * BLOCK_SIZE);
-
-    // Step 6: Initialize directory entries in the data block
-    struct wfs_dentry dir_entries[2] = {
-        { ".", root_inode_num },
-        { "..", root_inode_num }
-    };
-
-    if (pwrite(disk_fds[0], dir_entries, sizeof(dir_entries), root_inode.blocks[0]) != sizeof(dir_entries))
-    {
-        perror("[ERROR] Failed to write directory entries for root");
-        return -EIO;
-    }
-    printf("[DEBUG] Root directory entries written successfully.\n");
-
-    // Step 7: Write the root inode to disk
-    off_t inode_offset = sb.i_blocks_ptr + (root_inode_num * sizeof(struct wfs_inode));
-    if (pwrite(disk_fds[0], &root_inode, sizeof(root_inode), inode_offset) != sizeof(root_inode))
-    {
-        perror("[ERROR] Failed to write root inode to disk");
-        return -EIO;
-    }
-    printf("[DEBUG] Root inode written successfully at offset: %ld\n", inode_offset);
-
-    return 0;
-}
-
-
-void setup_bitmaps()
-{
-    size_t inode_bitmap_size = (superblock->num_inodes + 7) / 8; // Rounded up to nearest byte
-    size_t data_bitmap_size = (superblock->num_data_blocks + 7) / 8;
-
-    inode_bitmap = malloc(inode_bitmap_size);
-    if (!inode_bitmap)
-    {
-        fprintf(stderr, "[ERROR] Failed to allocate memory for inode bitmap.\n");
-        exit(EXIT_FAILURE);
-    }
-
-    data_bitmap = malloc(data_bitmap_size);
-    if (!data_bitmap)
-    {
-        fprintf(stderr, "[ERROR] Failed to allocate memory for data bitmap.\n");
-        exit(EXIT_FAILURE);
-    }
-
-    printf("[INFO] Bitmaps allocated: inode_bitmap_size=%zu, data_bitmap_size=%zu\n",
-           inode_bitmap_size, data_bitmap_size);
-}
-
-void initialize_bitmaps(int fd)
-{
-    size_t inode_bitmap_size = (superblock->num_inodes + 7) / 8;
-    size_t data_bitmap_size = (superblock->num_data_blocks + 7) / 8;
-
-    // Read inode bitmap from disk
-    pread(fd, inode_bitmap, inode_bitmap_size, superblock->i_bitmap_ptr);
-
-    // Read data bitmap from disk
-    pread(fd, data_bitmap, data_bitmap_size, superblock->d_bitmap_ptr);
-
-    printf("[INFO] Bitmaps initialized from disk.\n");
-}
-
-void save_bitmaps_to_disk(int fd)
-{
-    size_t inode_bitmap_size = (superblock->num_inodes + 7) / 8;
-    size_t data_bitmap_size = (superblock->num_data_blocks + 7) / 8;
-
-    // Write inode bitmap to disk
-    pwrite(fd, inode_bitmap, inode_bitmap_size, superblock->i_bitmap_ptr);
-
-    // Write data bitmap to disk
-    pwrite(fd, data_bitmap, data_bitmap_size, superblock->d_bitmap_ptr);
-
-    printf("[INFO] Bitmaps saved to disk.\n");
-}
-
+// used wfs_write
 int wfs_allocate_data_block()
 {
     printf("Entering wfs_allocate_data_block()\n");
@@ -256,6 +121,7 @@ int wfs_allocate_data_block()
     return -1; // No free data blocks
 }
 
+// used in wfs_add_dir_entry
 int wfs_read_inode(int inode_num, struct wfs_inode *inode)
 {
     printf("Entering wfs_read_inode(inode_num=%d)\n", inode_num);
@@ -336,6 +202,7 @@ int read_block(int block_num, void *buffer, size_t size)
     return EXIT_SUCCESS; // Success
 }
 
+// used in wfs_mknod
 int wfs_add_dir_entry(int parent_inode, const char *path, int inode_num)
 {
     printf("Entering wfs_add_dir_entry(parent_inode=%d, path=%s, inode_num=%d)\n", parent_inode, path, inode_num);
@@ -396,6 +263,7 @@ int wfs_add_dir_entry(int parent_inode, const char *path, int inode_num)
     return -ENOSPC; // No space to add the directory entry
 }
 
+// used in wfs_add_dir_entry, wfs_write, wfs_free_data_block
 void wfs_write_data_block(int block_num, void *data, size_t size)
 {
     printf("Entering wfs_write_data_block(block_num=%d, size=%zu)\n", block_num, size);
@@ -412,6 +280,7 @@ void wfs_write_data_block(int block_num, void *data, size_t size)
     printf("Data written to block %d\n", block_num);
 }
 
+// used in wfs_mknod, wfs_write
 void wfs_write_inode(int inode_num, struct wfs_inode *inode)
 {
     printf("Entering wfs_write_inode(inode_num=%d)\n", inode_num);
@@ -431,6 +300,7 @@ void wfs_write_inode(int inode_num, struct wfs_inode *inode)
     printf("Inode data written to disk\n");
 }
 
+// used in wfs_add_dir_entry, wfs_write, wfs_read, wfs_lookup_in_dir, wfs_lookup
 int wfs_read_data_block(int block_num, void *buffer, size_t size)
 {
     printf("Entering wfs_read_data_block(block_num=%d, size=%zu)\n", block_num, size);
@@ -453,6 +323,7 @@ int wfs_read_data_block(int block_num, void *buffer, size_t size)
     return EXIT_SUCCESS; // Success
 }
 
+// used in wfs_get_parent_inode
 int wfs_lookup_in_dir(int parent_inode, const char *name)
 {
     printf("Entering wfs_lookup_in_dir(parent_inode=%d, name=%s)\n", parent_inode, name);
@@ -495,6 +366,7 @@ int wfs_lookup_in_dir(int parent_inode, const char *name)
     return -ENOENT; // Name not found in any of the directory blocks
 }
 
+// used in get_inode_from_path
 int read_data_block(off_t block_offset, void *buffer, size_t size)
 {
     if (pread(disk_fd, buffer, size, block_offset) != size)
@@ -506,6 +378,7 @@ int read_data_block(off_t block_offset, void *buffer, size_t size)
     return 0;
 }
 
+// used in add_directory_entry, get_inode_from_path
 off_t calculate_block_offset(int block_num)
 {
     return sb.d_blocks_ptr + (block_num * BLOCK_SIZE);
@@ -563,32 +436,7 @@ struct wfs_inode *wfs_get_inode(int inode_num)
     return inode;
 }
 
-
-int resolve_path_to_inode(const char *path, struct wfs_inode *inode)
-{
-    printf("Resolving path %s to inode\n", path);
-
-    int inode_num = wfs_lookup(path);
-    if (inode_num == -1)
-    {
-        printf("Error: Path %s not found\n", path);
-        return -ENOENT; // Path not found
-    }
-
-    struct wfs_inode *found_inode = wfs_get_inode(inode_num);
-    if (!found_inode)
-    {
-        printf("Error: Failed to retrieve inode for %s\n", path);
-        return -EIO; // Error reading inode
-    }
-
-    // Copy the inode data to the provided struct
-    memcpy(inode, found_inode, sizeof(struct wfs_inode));
-
-    printf("Resolved path %s to inode %d\n", path, inode_num);
-    return inode_num; // Return inode number if successful
-}
-
+// used in get_inode_from_path
 int read_inode(int inode_num, struct wfs_inode *inode)
 {
     // Ensure disk_fd is correctly initialized and points to the correct disk
@@ -606,7 +454,7 @@ int read_inode(int inode_num, struct wfs_inode *inode)
     if (pread(current_disk_fd, inode, sizeof(struct wfs_inode), offset) != sizeof(struct wfs_inode))
     {
         perror("[ERROR] Failed to read inode");
-        return -EIO;  // Return I/O error if read fails
+        return -EIO; // Return I/O error if read fails
     }
 
     // After reading, print the inode data for debugging
@@ -616,206 +464,7 @@ int read_inode(int inode_num, struct wfs_inode *inode)
     return 0; // Return 0 on success
 }
 
-
-int get_inode_from_path(const char *path, int *inode_num, struct wfs_inode *inode)
-{
-    printf("[DEBUG] Resolving path: %s\n", path);
-
-    if (path == NULL || inode_num == NULL || inode == NULL)
-    {
-        fprintf(stderr, "[ERROR] Invalid arguments to get_inode_from_path.\n");
-        return -EINVAL;
-    }
-
-    if (strcmp(path, "/") == 0)
-    {
-        // Root directory special case
-        *inode_num = ROOT_INODE_NUM;
-        if (read_inode(ROOT_INODE_NUM, inode) != 0)
-        {
-            fprintf(stderr, "[ERROR] Failed to read root inode.\n");
-            return -EIO;
-        }
-        return 0;
-    }
-
-    // Tokenize the path into components
-    char *path_copy = strdup(path);
-    if (path_copy == NULL)
-    {
-        perror("[ERROR] strdup failed");
-        return -ENOMEM;
-    }
-
-    char *token = strtok(path_copy, "/");
-    int current_inode_num = ROOT_INODE_NUM;
-    struct wfs_inode current_inode;
-
-    if (read_inode(current_inode_num, &current_inode) != 0)
-    {
-        fprintf(stderr, "[ERROR] Failed to read root inode.\n");
-        free(path_copy);
-        return -EIO;
-    }
-
-    // Traverse the path components
-    while (token != NULL)
-    {
-        if (!S_ISDIR(current_inode.mode))
-        {
-            fprintf(stderr, "[ERROR] %s is not a directory.\n", token);
-            free(path_copy);
-            return -ENOTDIR;
-        }
-
-        // Find the next component in the directory
-        int found = 0;
-        for (int i = 0; i < N_BLOCKS && current_inode.blocks[i] != 0; i++)
-        {
-            struct wfs_dentry entries[BLOCK_SIZE / sizeof(struct wfs_dentry)];
-            off_t block_offset = calculate_block_offset(current_inode.blocks[i]);
-
-            if (read_data_block(block_offset, entries, sizeof(entries)) != 0)
-            {
-                fprintf(stderr, "[ERROR] Failed to read directory block.\n");
-                free(path_copy);
-                return -EIO;
-            }
-
-            // Iterate through entries in the block
-            for (size_t j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
-            {
-
-                printf("[DEBUG] Traversing component: %s\n", token);
-                printf("[DEBUG] Current inode num: %d\n", current_inode_num);
-                printf("[DEBUG] Reading block: %ld\n", block_offset);
-
-                if (entries[j].num != 0 && strcmp(entries[j].name, token) == 0)
-                {
-                    printf("[DEBUG] Directory entry: name=%s, num=%d\n",
-                           entries[j].name, entries[j].num);
-
-                    // Match found
-                    current_inode_num = entries[j].num;
-                    if (read_inode(current_inode_num, &current_inode) != 0)
-                    {
-                        fprintf(stderr, "[ERROR] Failed to read inode for %s.\n", token);
-                        free(path_copy);
-                        return -EIO;
-                    }
-                    found = 1;
-                    break;
-                }
-            }
-            if (found)
-                break;
-        }
-
-        if (!found)
-        {
-            fprintf(stderr, "[ERROR] Path component %s not found.\n", token);
-            free(path_copy);
-            return -ENOENT;
-        }
-
-        token = strtok(NULL, "/");
-    }
-
-    // Path resolved successfully
-    *inode_num = current_inode_num;
-    memcpy(inode, &current_inode, sizeof(struct wfs_inode));
-    free(path_copy);
-    return 0;
-}
-
-// Basic getattr implementation
-static int wfs_getattr(const char *path, struct stat *stbuf)
-{
-    printf("[DEBUG] getattr called for path: %s\n", path);
-
-    // Print the contents of the struct stat, if it's not NULL
-    if (stbuf != NULL) {
-        printf("[DEBUG] struct stat details:\n");
-        printf("  st_mode: %x\n", stbuf->st_mode);   // File mode (permissions and file type)
-        printf("  st_uid: %d\n", stbuf->st_uid);       // User ID of owner
-        printf("  st_gid: %d\n", stbuf->st_gid);       // Group ID of owner
-        printf("  st_size: %ld\n", stbuf->st_size);   // Size of the file
-        printf("  st_atime: %ld\n", stbuf->st_atime); // Last access time
-        printf("  st_mtime: %ld\n", stbuf->st_mtime); // Last modification time
-        printf("  st_ctime: %ld\n", stbuf->st_ctime); // Last status change time
-        printf("  st_nlink: %ld\n", stbuf->st_nlink); // Number of hard links
-    } else {
-        printf("[ERROR] struct stat is NULL\n");
-    }
-
-    // Clear the stat buffer
-    memset(stbuf, 0, sizeof(struct stat));
-
-    // Handle root directory specifically
-    if (strcmp(path, "/") == 0)
-    {
-        printf("[DEBUG] Path is root directory.\n");
-
-        stbuf->st_mode = S_IFDIR | 0755; // Directory with permissions 755
-        stbuf->st_nlink = 2;             // "." and ".."
-        stbuf->st_uid = getuid();        // User ID of the process
-        stbuf->st_gid = getgid();        // Group ID of the process
-        stbuf->st_size = BLOCK_SIZE;     // Size of the root directory block
-
-        printf("[DEBUG] Root directory attributes set: mode=%o, nlink=%lu, size=%ld\n",
-               stbuf->st_mode, stbuf->st_nlink, stbuf->st_size);
-        return EXIT_SUCCESS;
-    }
-
-    // Get inode from the path
-    int inode_num = -1;
-    struct wfs_inode inode;
-
-    printf("[DEBUG] Resolving inode for path: %s\n", path);
-    if (get_inode_from_path(path, &inode_num, &inode) != 0)
-    {
-        printf("[DEBUG] Path not found: %s\n", path);
-        return -ENOENT;
-    }
-
-    printf("[DEBUG] Inode resolved for path: %s, inode number: %d\n", path, inode_num);
-
-    // Populate stat structure based on inode attributes
-    stbuf->st_uid = inode.uid;
-    stbuf->st_gid = inode.gid;
-    stbuf->st_size = inode.size;
-    stbuf->st_nlink = inode.nlinks;
-    printf("[DEBUG] Inode attributes: uid=%u, gid=%u, size=%lu, nlinks=%u\n",
-           inode.uid, inode.gid, inode.size, inode.nlinks);
-
-    if (S_ISDIR(inode.mode)) // Directory
-    {
-        stbuf->st_mode = S_IFDIR | (inode.mode & 0777);
-        printf("[DEBUG] Path is a directory. Mode set to %o\n", stbuf->st_mode);
-    }
-    else if (S_ISREG(inode.mode)) // Regular file
-    {
-        stbuf->st_mode = S_IFREG | (inode.mode & 0777);
-        printf("[DEBUG] Path is a regular file. Mode set to %o\n", stbuf->st_mode);
-    }
-    else
-    {
-        printf("[DEBUG] Unsupported inode type for path: %s\n", path);
-        return -ENOENT; // Unsupported file type
-    }
-
-    // Set access, modification, and status change times
-    stbuf->st_atime = inode.atim;
-    stbuf->st_mtime = inode.mtim;
-    stbuf->st_ctime = inode.ctim;
-
-    printf("[DEBUG] Times set: atime=%ld, mtime=%ld, ctime=%ld\n",
-           stbuf->st_atime, stbuf->st_mtime, stbuf->st_ctime);
-
-    return EXIT_SUCCESS;
-}
-
-// Helper function to get the inode of the parent directory from the given path
+// Helper function to get the inode of the parent directory from the given path, used in wfs_lookup, wfs_mknod
 int wfs_get_parent_inode(const char *path)
 {
     printf("Getting parent inode for path %s\n", path);
@@ -860,7 +509,7 @@ int wfs_get_parent_inode(const char *path)
     return parent_inode;
 }
 
-// Function to perform the lookup of a file or directory in the filesystem
+// Function to perform the lookup of a file or directory in the filesystem, wfs_allocate_inode, and mknod, rmdir, read, write
 int wfs_lookup(const char *path)
 {
     printf("Looking up path %s\n", path);
@@ -924,54 +573,56 @@ int wfs_lookup(const char *path)
     return -ENOENT; // Entry not found
 }
 
+// used in allocate_free_inode, allocate_free_data_block
 static int get_bit(uint8_t *bitmap, size_t index)
 {
     return (bitmap[index / 8] >> (index % 8)) & 1;
 }
 
-static void set_bit(uint8_t *bitmap, size_t index)
-{
-    bitmap[index / 8] |= (1 << (index % 8));
-}
+// used in allocate_free_inode, allocate_free_data_block
+// static void set_bit(uint8_t *bitmap, size_t index)
+// {
+//     bitmap[index / 8] |= (1 << (index % 8));
+// }
 
-static int allocate_free_inode()
+int allocate_free_inode()
 {
     for (size_t i = 0; i < sb.num_inodes; i++)
     {
         if (!get_bit(inode_bitmap, i))
-        {                             // Check if the inode is free
-            set_bit(inode_bitmap, i); // Mark the inode as used
-            return i;                 // Return the allocated inode number
+        { // Check if the inode is free
+            // set_bit(inode_bitmap, i); // Mark the inode as used
+            return i; // Return the allocated inode number
         }
     }
     return -1; // No free inode available
 }
 
-static int allocate_free_data_block()
+int allocate_free_data_block()
 {
     for (size_t i = 0; i < sb.num_data_blocks; i++)
     {
         if (!get_bit(data_bitmap, i))
-        {                            // Check if the block is free
-            set_bit(data_bitmap, i); // Mark the block as used
-            return i;                // Return the allocated block number
+        { // Check if the block is free
+            // set_bit(data_bitmap, i); // Mark the block as used
+            return i; // Return the allocated block number
         }
     }
     return -1; // No free block available
 }
 
-static int write_inode(int inode_num, const struct wfs_inode *inode)
-{
-    off_t inode_offset = sb.i_blocks_ptr + (inode_num * sizeof(struct wfs_inode));
-    if (pwrite(disk_fds[0], inode, sizeof(struct wfs_inode), inode_offset) != sizeof(struct wfs_inode))
-    {
-        perror("[ERROR] Failed to write inode");
-        return -1;
-    }
-    return 0; // Success
-}
+// int write_inode(int inode_num, const struct wfs_inode *inode)
+// {
+//     off_t inode_offset = sb.i_blocks_ptr + (inode_num * sizeof(struct wfs_inode));
+//     if (pwrite(disk_fds[0], inode, sizeof(struct wfs_inode), inode_offset) != sizeof(struct wfs_inode))
+//     {
+//         perror("[ERROR] Failed to write inode");
+//         return -1;
+//     }
+//     return 0; // Success
+// }
 
-static int write_data_block(off_t block_offset, const void *data, size_t size)
+int write_data_block(off_t block_offset, const void *data, size_t size)
 {
     if (pwrite(disk_fds[0], data, size, block_offset) != (ssize_t)size)
     {
@@ -981,118 +632,118 @@ static int write_data_block(off_t block_offset, const void *data, size_t size)
     return 0; // Success
 }
 
-static int add_directory_entry(struct wfs_inode *parent_inode, int parent_inode_num,
-                               int new_inode_num, const char *entry_name)
-{
-    struct wfs_dentry entries[ENTRIES_PER_BLOCK];
+// int add_directory_entry(struct wfs_inode *parent_inode, int parent_inode_num,
+//                         int new_inode_num, const char *entry_name)
+// {
+//     struct wfs_dentry entries[ENTRIES_PER_BLOCK];
 
-    // Step 1: Read the i_bitmap from disk into memory
-    printf("[DEBUG] Reading inode bitmap from disk. i_bitmap_ptr: %ld\n", superblock->i_bitmap_ptr);
-    uint8_t i_bitmap[superblock->num_inodes / 8 + 1]; // Assuming each inode takes 1 bit in the bitmap
-    if (pread(disk_fds[0], i_bitmap, sizeof(i_bitmap), superblock->i_bitmap_ptr) != sizeof(i_bitmap))
-    {
-        perror("[ERROR] Failed to read inode bitmap");
-        return -1;
-    }
+//     // Step 1: Read the i_bitmap from disk into memory
+//     printf("[DEBUG] Reading inode bitmap from disk. i_bitmap_ptr: %ld\n", superblock->i_bitmap_ptr);
+//     uint8_t i_bitmap[superblock->num_inodes / 8 + 1]; // Assuming each inode takes 1 bit in the bitmap
+//     if (pread(disk_fds[0], i_bitmap, sizeof(i_bitmap), superblock->i_bitmap_ptr) != sizeof(i_bitmap))
+//     {
+//         perror("[ERROR] Failed to read inode bitmap");
+//         return -1;
+//     }
 
-    // Step 2: Find a free inode (using i_bitmap)
-    int new_inode = -1;
-    printf("[DEBUG] Searching for a free inode...\n");
-    for (size_t i = 0; i < superblock->num_inodes; i++)
-    {
-        if ((i_bitmap[i / 8] & (1 << (i % 8))) == 0)
-        {
-            new_inode = i; // Found a free inode
-            printf("[DEBUG] Found free inode: %d\n", new_inode);
-            i_bitmap[i / 8] |= (1 << (i % 8)); // Mark inode as allocated
-            break;
-        }
-    }
-    if (new_inode == -1)
-    {
-        fprintf(stderr, "[ERROR] No free inodes available.\n");
-        return -1;
-    }
+//     // Step 2: Find a free inode (using i_bitmap)
+//     int new_inode = -1;
+//     printf("[DEBUG] Searching for a free inode...\n");
+//     for (size_t i = 0; i < superblock->num_inodes; i++)
+//     {
+//         if ((i_bitmap[i / 8] & (1 << (i % 8))) == 0)
+//         {
+//             new_inode = i; // Found a free inode
+//             printf("[DEBUG] Found free inode: %d\n", new_inode);
+//             i_bitmap[i / 8] |= (1 << (i % 8)); // Mark inode as allocated
+//             break;
+//         }
+//     }
+//     if (new_inode == -1)
+//     {
+//         fprintf(stderr, "[ERROR] No free inodes available.\n");
+//         return -1;
+//     }
 
-    // Step 3: Read the d_bitmap from disk into memory
-    printf("[DEBUG] Reading data block bitmap from disk. d_bitmap_ptr: %ld\n", superblock->d_bitmap_ptr);
-    uint8_t d_bitmap[superblock->num_data_blocks / 8 + 1]; // Assuming each data block takes 1 bit in the bitmap
-    if (pread(disk_fds[0], d_bitmap, sizeof(d_bitmap), superblock->d_bitmap_ptr) != sizeof(d_bitmap))
-    {
-        perror("[ERROR] Failed to read data block bitmap");
-        return -1;
-    }
+//     // Step 3: Read the d_bitmap from disk into memory
+//     printf("[DEBUG] Reading data block bitmap from disk. d_bitmap_ptr: %ld\n", superblock->d_bitmap_ptr);
+//     uint8_t d_bitmap[superblock->num_data_blocks / 8 + 1]; // Assuming each data block takes 1 bit in the bitmap
+//     if (pread(disk_fds[0], d_bitmap, sizeof(d_bitmap), superblock->d_bitmap_ptr) != sizeof(d_bitmap))
+//     {
+//         perror("[ERROR] Failed to read data block bitmap");
+//         return -1;
+//     }
 
-    // Step 4: Look for a free data block (using d_bitmap)
-    int free_data_block = -1;
-    printf("[DEBUG] Searching for a free data block...\n");
-    for (size_t i = 0; i < superblock->num_data_blocks; i++)
-    {
-        if ((d_bitmap[i / 8] & (1 << (i % 8))) == 0)
-        {
-            free_data_block = i; // Found a free data block
-            printf("[DEBUG] Found free data block: %d\n", free_data_block);
-            d_bitmap[i / 8] |= (1 << (i % 8)); // Mark data block as allocated
-            break;
-        }
-    }
-    if (free_data_block == -1)
-    {
-        fprintf(stderr, "[ERROR] No free data blocks available.\n");
-        return -1;
-    }
+//     // Step 4: Look for a free data block (using d_bitmap)
+//     int free_data_block = -1;
+//     printf("[DEBUG] Searching for a free data block...\n");
+//     for (size_t i = 0; i < superblock->num_data_blocks; i++)
+//     {
+//         if ((d_bitmap[i / 8] & (1 << (i % 8))) == 0)
+//         {
+//             free_data_block = i; // Found a free data block
+//             printf("[DEBUG] Found free data block: %d\n", free_data_block);
+//             d_bitmap[i / 8] |= (1 << (i % 8)); // Mark data block as allocated
+//             break;
+//         }
+//     }
+//     if (free_data_block == -1)
+//     {
+//         fprintf(stderr, "[ERROR] No free data blocks available.\n");
+//         return -1;
+//     }
 
-    // Initialize the new directory block
-    memset(entries, 0, sizeof(entries));
-    strncpy(entries[0].name, entry_name, MAX_NAME_LEN);
-    entries[0].num = new_inode_num;
+//     // Initialize the new directory block
+//     memset(entries, 0, sizeof(entries));
+//     strncpy(entries[0].name, entry_name, MAX_NAME_LEN);
+//     entries[0].num = new_inode_num;
 
-    off_t new_block_offset = calculate_block_offset(free_data_block);
-    printf("[DEBUG] Writing new directory block at offset: %ld\n", new_block_offset);
-    if (pwrite(disk_fds[0], entries, sizeof(entries), new_block_offset) != sizeof(entries))
-    {
-        perror("[ERROR] Failed to write new directory block");
-        return -1;
-    }
+//     off_t new_block_offset = calculate_block_offset(free_data_block);
+//     printf("[DEBUG] Writing new directory block at offset: %ld\n", new_block_offset);
+//     if (pwrite(disk_fds[0], entries, sizeof(entries), new_block_offset) != sizeof(entries))
+//     {
+//         perror("[ERROR] Failed to write new directory block");
+//         return -1;
+//     }
 
-    // Step 5: Update the parent inode
-    // printf("[DEBUG] Updating parent inode: blocks_count=%d\n", parent_inode->blocks_count);
-    // parent_inode->blocks[parent_inode->blocks_count++] = free_data_block;
-    // parent_inode->size += BLOCK_SIZE;
+//     // Step 5: Update the parent inode
+//     // printf("[DEBUG] Updating parent inode: blocks_count=%d\n", parent_inode->blocks_count);
+//     // parent_inode->blocks[parent_inode->blocks_count++] = free_data_block;
+//     // parent_inode->size += BLOCK_SIZE;
 
-    // Step 6: Write the updated i_bitmap and d_bitmap back to disk
-    printf("[DEBUG] Writing updated inode bitmap to disk.\n");
-    if (pwrite(disk_fds[0], i_bitmap, sizeof(i_bitmap), superblock->i_bitmap_ptr) != sizeof(i_bitmap))
-    {
-        perror("[ERROR] Failed to write inode bitmap");
-        return -1;
-    }
+//     // Step 6: Write the updated i_bitmap and d_bitmap back to disk
+//     printf("[DEBUG] Writing updated inode bitmap to disk.\n");
+//     if (pwrite(disk_fds[0], i_bitmap, sizeof(i_bitmap), superblock->i_bitmap_ptr) != sizeof(i_bitmap))
+//     {
+//         perror("[ERROR] Failed to write inode bitmap");
+//         return -1;
+//     }
 
-    printf("[DEBUG] Writing updated data block bitmap to disk.\n");
-    if (pwrite(disk_fds[0], d_bitmap, sizeof(d_bitmap), superblock->d_bitmap_ptr) != sizeof(d_bitmap))
-    {
-        perror("[ERROR] Failed to write data block bitmap");
-        return -1;
-    }
+//     printf("[DEBUG] Writing updated data block bitmap to disk.\n");
+//     if (pwrite(disk_fds[0], d_bitmap, sizeof(d_bitmap), superblock->d_bitmap_ptr) != sizeof(d_bitmap))
+//     {
+//         perror("[ERROR] Failed to write data block bitmap");
+//         return -1;
+//     }
 
-    // Write the updated parent inode (if required)
-    printf("[DEBUG] Writing updated parent inode: %d\n", parent_inode_num);
-    if (write_inode(parent_inode_num, parent_inode) != 0)
-    {
-        fprintf(stderr, "[ERROR] Failed to update parent inode.\n");
-        return -1;
-    }
+//     // Write the updated parent inode (if required)
+//     printf("[DEBUG] Writing updated parent inode: %d\n", parent_inode_num);
+//     if (write_inode(parent_inode_num, parent_inode) != 0)
+//     {
+//         fprintf(stderr, "[ERROR] Failed to update parent inode.\n");
+//         return -1;
+//     }
 
-    // Print the state of the superblock
-    printf("[DEBUG] Superblock State:\n");
-    printf("  RAID Mode: %d\n", superblock->raid_mode);
-    printf("  Number of Inodes: %ld\n", superblock->num_inodes);
-    printf("  Number of Data Blocks: %ld\n", superblock->num_data_blocks);
-    printf("  i_bitmap_ptr: %ld\n", superblock->i_bitmap_ptr);
-    printf("  d_bitmap_ptr: %ld\n", superblock->d_bitmap_ptr);
+//     // Print the state of the superblock
+//     printf("[DEBUG] Superblock State:\n");
+//     printf("  RAID Mode: %d\n", superblock->raid_mode);
+//     printf("  Number of Inodes: %ld\n", superblock->num_inodes);
+//     printf("  Number of Data Blocks: %ld\n", superblock->num_data_blocks);
+//     printf("  i_bitmap_ptr: %ld\n", superblock->i_bitmap_ptr);
+//     printf("  d_bitmap_ptr: %ld\n", superblock->d_bitmap_ptr);
 
-    return 0; // Success
-}
+//     return 0; // Success
+// }
 
 void free_inode(int inode_num)
 {
@@ -1102,120 +753,6 @@ void free_inode(int inode_num)
 void free_data_block(int block_num)
 {
     // Your logic for freeing a data block
-}
-
-// Function to create a new directory
-static int wfs_mkdir(const char *path, mode_t mode)
-{
-    printf("[DEBUG] mkdir called for path: %s with mode: %o\n", path, mode);
-
-    // 1. Validate the input path
-    if (strlen(path) == 0 || strlen(path) >= MAX_PATH_LEN)
-    {
-        fprintf(stderr, "[ERROR] Invalid path length: %zu\n", strlen(path));
-        return -EINVAL;
-    }
-
-    // Check if the directory already exists
-    struct wfs_inode dummy_inode;
-    int dummy_inode_num;
-    if (get_inode_from_path(path, &dummy_inode_num, &dummy_inode) == 0)
-    {
-        fprintf(stderr, "[ERROR] Directory already exists: %s\n", path);
-        return -EEXIST;
-    }
-
-    // 2. Parse the path
-    char path_copy[MAX_PATH_LEN];
-    strncpy(path_copy, path, MAX_PATH_LEN);
-
-    char *parent_path = dirname(path_copy);   // Parent directory path
-    char *new_dir_name = basename(path_copy); // New directory name
-
-    if (strlen(new_dir_name) >= MAX_NAME_LEN)
-    {
-        fprintf(stderr, "[ERROR] Directory name too long: %s\n", new_dir_name);
-        return -ENAMETOOLONG;
-    }
-
-    // 3. Locate the parent directory
-    struct wfs_inode parent_inode;
-    int parent_inode_num;
-    if (get_inode_from_path(parent_path, &parent_inode_num, &parent_inode) != 0)
-    {
-        fprintf(stderr, "[ERROR] Parent directory not found: %s\n", parent_path);
-        return -ENOENT;
-    }
-
-    if ((parent_inode.mode & S_IFDIR) == 0)
-    {
-        fprintf(stderr, "[ERROR] Parent is not a directory: %s\n", parent_path);
-        return -ENOTDIR;
-    }
-
-    // 4. Allocate a free inode and data block for the new directory
-    int new_inode_num = allocate_free_inode();
-    if (new_inode_num < 0)
-    {
-        fprintf(stderr, "[ERROR] No free inode available.\n");
-        return -ENOSPC;
-    }
-
-    int new_data_block = allocate_free_data_block();
-    if (new_data_block < 0)
-    {
-        fprintf(stderr, "[ERROR] No free data block available.\n");
-        free_inode(new_inode_num); // Free the allocated inode
-        return -ENOSPC;
-    }
-
-    // 5. Initialize the new directory inode
-    struct wfs_inode new_dir_inode = {
-        .mode = S_IFDIR | mode,
-        .size = BLOCK_SIZE, // 1 block for the initial entries
-        .nlinks = 2,        // "." and parent ("..")
-        .blocks = {new_data_block}};
-
-    if (write_inode(new_inode_num, &new_dir_inode) != 0)
-    {
-        fprintf(stderr, "[ERROR] Failed to write new directory inode.\n");
-        free_inode(new_inode_num);
-        free_data_block(new_data_block);
-        return -EIO;
-    }
-
-    // 6. Write the initial "." and ".." entries to the new directory block
-    struct wfs_dentry dot_entries[2] = {
-        {.num = new_inode_num, .name = "."},
-        {.num = parent_inode_num, .name = ".."}};
-
-    if (write_data_block(calculate_block_offset(new_data_block), dot_entries, sizeof(dot_entries)) != 0)
-    {
-        fprintf(stderr, "[ERROR] Failed to initialize directory entries.\n");
-        free_inode(new_inode_num);
-        free_data_block(new_data_block);
-        return -EIO;
-    }
-
-    // 7. Add the new directory to the parent directory
-    if (add_directory_entry(&parent_inode, parent_inode_num, new_inode_num, new_dir_name) != 0)
-    {
-        fprintf(stderr, "[ERROR] Failed to add entry to parent directory.\n");
-        free_inode(new_inode_num);
-        free_data_block(new_data_block);
-        return -ENOSPC;
-    }
-
-    // 8. Update the parent directory inode
-    parent_inode.nlinks++; // Increment link count for the new subdirectory
-    if (write_inode(parent_inode_num, &parent_inode) != 0)
-    {
-        fprintf(stderr, "[ERROR] Failed to update parent directory inode.\n");
-        return -EIO;
-    }
-
-    printf("[DEBUG] Directory created successfully: %s\n", path);
-    return 0; // Success
 }
 
 int wfs_allocate_inode(struct wfs_inode *inode, uint16_t mode)
@@ -1251,10 +788,11 @@ int wfs_allocate_inode(struct wfs_inode *inode, uint16_t mode)
     return -1; // No free inodes
 }
 
-static int wfs_mknod(const char *path, mode_t mode, dev_t dev)
+int wfs_mknod(const char *path, mode_t mode, dev_t dev)
 {
+    printf("[FUNCTION] wfs_mknod\n");
     // Debug: Log function entry
-    printf("[DEBUG] wfs_mknod called for path: %s, mode: %d, dev: %ld\n", path, mode, dev);
+    // printf("[DEBUG] wfs_mknod called for path: %s, mode: %d, dev: %ld\n", path, mode, dev);
 
     // Check if the file already exists
     if (wfs_lookup(path) != -1)
@@ -1320,9 +858,9 @@ static int wfs_mknod(const char *path, mode_t mode, dev_t dev)
     return EXIT_SUCCESS; // Success
 }
 
-static int wfs_unlink(const char *path)
+int wfs_unlink(const char *path)
 {
-    printf("Entering wfs_unlink %s\n", path);
+    printf("[FUNCTIOn] wfs_unlink %s\n", path);
     int inode_num = wfs_lookup(path);
     if (inode_num == -1)
     {
@@ -1346,6 +884,7 @@ static int wfs_unlink(const char *path)
     return EXIT_SUCCESS;
 }
 
+// used in wfs_rmdir
 void wfs_free_data_block(int block_num)
 {
     if (block_num < 0 || block_num >= N_BLOCKS)
@@ -1370,7 +909,7 @@ void wfs_free_data_block(int block_num)
     printf("[INFO] Freed block number: %d\n", block_num);
 }
 
-static int wfs_rmdir(const char *path)
+int wfs_rmdir(const char *path)
 {
     printf("Entering wfs_rmdir %s\n", path);
     int inode_num = wfs_lookup(path);
@@ -1395,7 +934,7 @@ static int wfs_rmdir(const char *path)
     return EXIT_SUCCESS;
 }
 
-static int wfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
+int wfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
     printf("Entering wfs_read %s\n", path);
     int inode_num = wfs_lookup(path);
@@ -1437,7 +976,7 @@ static int wfs_read(const char *path, char *buf, size_t size, off_t offset, stru
     return bytes_read;
 }
 
-static int wfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
+int wfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
     printf("Entering wfs_write %s\n", path);
     int inode_num = wfs_lookup(path);
@@ -1479,72 +1018,347 @@ static int wfs_write(const char *path, const char *buf, size_t size, off_t offse
     return size;
 }
 
-//directory entries are successfully retrieved and filled into the buffer.
-static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
+static struct fuse_operations wfs_operations = {
+    // .getattr = wfs_getattr,
+    // .mknod = wfs_mknod,
+    .mkdir = wfs_mkdir,
+    // .unlink = wfs_unlink,
+    // .rmdir = wfs_rmdir,
+    // .read = wfs_read,
+    // .write = wfs_write,
+    // .readdir = wfs_readdir,
+};
+
+// Basic getattr implementation
+// int wfs_getattr(const char *path, struct stat *stbuf)
+// {
+//     printf("[FUNCTION] getattr called for path: %s\n", path);
+
+//     // Print the contents of the struct stat, if it's not NULL
+//     if (stbuf != NULL) {
+//         printf("[DEBUG] struct stat details:\n");
+//         printf("  st_mode: %x\n", stbuf->st_mode);   // File mode (permissions and file type)
+//         printf("  st_uid: %d\n", stbuf->st_uid);       // User ID of owner
+//         printf("  st_gid: %d\n", stbuf->st_gid);       // Group ID of owner
+//         printf("  st_size: %ld\n", stbuf->st_size);   // Size of the file
+//         printf("  st_atime: %ld\n", stbuf->st_atime); // Last access time
+//         printf("  st_mtime: %ld\n", stbuf->st_mtime); // Last modification time
+//         printf("  st_ctime: %ld\n", stbuf->st_ctime); // Last status change time
+//         printf("  st_nlink: %ld\n", stbuf->st_nlink); // Number of hard links
+//     } else {
+//         printf("[ERROR] struct stat is NULL\n");
+//     }
+// /*
+//     memset(stbuf, 0, sizeof(struct stat));
+
+//     // Locate the inode for the given path
+//     struct wfs_inode inode;
+//     int inode_index = lookup_inode(path, &inode);
+//     if (inode_index < 0)
+//     {
+//         return -ENOENT; // File or directory does not exist
+//     }
+
+//     // Populate the stat structure with inode details
+//     stbuf->st_mode = inode.mode;
+//     stbuf->st_nlink = inode.nlinks;
+//     stbuf->st_uid = inode.uid;
+//     stbuf->st_gid = inode.gid;
+//     stbuf->st_size = inode.size;
+//     // stbuf->st_atime = inode.atime;
+//     // stbuf->st_mtime = inode.mtime;
+//     // stbuf->st_ctime = inode.ctime;
+// */
+// /*
+//     // Clear the stat buffer
+//     memset(stbuf, 0, sizeof(struct stat));
+
+//     // Handle root directory specifically
+//     if (strcmp(path, "/") == 0)
+//     {
+//         printf("[DEBUG] Path is root directory.\n");
+
+//         stbuf->st_mode = S_IFDIR | 0755; // Directory with permissions 755
+//         stbuf->st_nlink = 2;             // "." and ".."
+//         stbuf->st_uid = getuid();        // User ID of the process
+//         stbuf->st_gid = getgid();        // Group ID of the process
+//         stbuf->st_size = BLOCK_SIZE;     // Size of the root directory block
+
+//         printf("[DEBUG] Root directory attributes set: mode=%o, nlink=%lu, size=%ld\n",
+//                stbuf->st_mode, stbuf->st_nlink, stbuf->st_size);
+//         return EXIT_SUCCESS;
+//     }
+
+//     // Get inode from the path
+//     int inode_num = -1;
+//     struct wfs_inode inode;
+
+//     printf("[DEBUG] Resolving inode for path: %s\n", path);
+//     if (get_inode_from_path(path, &inode_num, &inode) != 0)
+//     {
+//         printf("[DEBUG] Path not found: %s\n", path);
+//         return -ENOENT;
+//     }
+
+//     printf("[DEBUG] Inode resolved for path: %s, inode number: %d\n", path, inode_num);
+
+//     // Populate stat structure based on inode attributes
+//     stbuf->st_uid = inode.uid;
+//     stbuf->st_gid = inode.gid;
+//     stbuf->st_size = inode.size;
+//     stbuf->st_nlink = inode.nlinks;
+//     printf("[DEBUG] Inode attributes: uid=%u, gid=%u, size=%lu, nlinks=%u\n",
+//            inode.uid, inode.gid, inode.size, inode.nlinks);
+
+//     if (S_ISDIR(inode.mode)) // Directory
+//     {
+//         stbuf->st_mode = S_IFDIR | (inode.mode & 0777);
+//         printf("[DEBUG] Path is a directory. Mode set to %o\n", stbuf->st_mode);
+//     }
+//     else if (S_ISREG(inode.mode)) // Regular file
+//     {
+//         stbuf->st_mode = S_IFREG | (inode.mode & 0777);
+//         printf("[DEBUG] Path is a regular file. Mode set to %o\n", stbuf->st_mode);
+//     }
+//     else
+//     {
+//         printf("[DEBUG] Unsupported inode type for path: %s\n", path);
+//         return -ENOENT; // Unsupported file type
+//     }
+
+//     // Set access, modification, and status change times
+//     stbuf->st_atime = inode.atim;
+//     stbuf->st_mtime = inode.mtim;
+//     stbuf->st_ctime = inode.ctim;
+// */
+//     //printf("[DEBUG] Times set: atime=%ld, mtime=%ld, ctime=%ld\n", stbuf->st_atime, stbuf->st_mtime, stbuf->st_ctime);
+
+//     return EXIT_SUCCESS;
+// }
+
+// struct wfs_inode *resolve_path_to_inode(const char *path)
+// {
+//     if (strcmp(path, "/") == 0)
+//     {
+//         // Root directory is always inode 0
+//         return get_inode(sb, 0);
+//     }
+
+//     char path_copy[256];
+//     strncpy(path_copy, path, sizeof(path_copy));
+//     path_copy[sizeof(path_copy) - 1] = '\0';
+
+//     char *token = strtok(path_copy, "/");
+//     struct wfs_inode *current_inode = get_inode(sb, 0); // Start at root inode
+
+//     while (token)
+//     {
+//         if (!S_ISDIR(current_inode->mode))
+//         {
+//             // If current inode is not a directory, the path is invalid
+//             perror("Path component is not a directory");
+//             return NULL;
+//         }
+
+//         struct wfs_dentry *entry = NULL;
+//         int found = 0;
+
+//         // Search for the token in the current directory's entries
+//         for (int i = 0; i < D_BLOCK; i++)
+//         {
+//             if (current_inode->blocks[i] == 0)
+//                 continue;
+
+//             struct wfs_dentry *entries = read_directory_block(sb, current_inode->blocks[i]);
+//             for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
+//             {
+//                 if (entries[j].num == 0) // Empty entry
+//                     continue;
+
+//                 if (strncmp(entries[j].name, token, MAX_NAME) == 0)
+//                 {
+//                     // Found the directory entry matching the token
+//                     entry = &entries[j];
+//                     found = 1;
+//                     break;
+//                 }
+//             }
+//             if (found)
+//                 break;
+//         }
+
+//         if (!entry)
+//         {
+//             // Token not found in the current directory
+//             perror("Path component not found in directory");
+//             return NULL;
+//         }
+
+//         // Move to the next inode (file or directory)
+//         current_inode = get_inode(sb, entry->num);
+//         token = strtok(NULL, "/");
+//     }
+
+//     return current_inode;
+// }
+
+// /**
+//  * Retrieves attributes of a file or directory.
+//  */
+// int wfs_getattr(const char *path, struct stat *stbuf)
+// {
+//     printf("[FUNCTION] Getting gettattr for path: %s\n", path);
+
+//     // Resolve the inode of the file/directory
+//     struct wfs_inode *inode = resolve_path_to_inode(path);
+//     if (!inode)
+//     {
+//         perror("File or directory not found");
+//         return -ENOENT;
+//     }
+
+//     memset(stbuf, 0, sizeof(struct stat));
+
+//     stbuf->st_ino = inode->num;
+//     stbuf->st_mode = inode->mode;
+//     stbuf->st_nlink = inode->nlinks;
+//     stbuf->st_uid = inode->uid;
+//     stbuf->st_gid = inode->gid;
+//     stbuf->st_size = inode->size;
+//     stbuf->st_atime = inode->atim;
+//     stbuf->st_mtime = inode->mtim;
+//     stbuf->st_ctime = inode->ctim;
+
+//     return 0;
+// }
+
+// directory entries are successfully retrieved and filled into the buffer.
+int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
 {
     printf("[DEBUG] Entering wfs_readdir for path: %s\n", path);
     printf("[DEBUG] Offset: %ld\n", offset);
     printf("[DEBUG] fuse_file_info (fi) details: \n");
 
-    // Print the contents of fuse_file_info (fi)
-    if (fi != NULL) {
-        printf("  fi->flags: %d\n", fi->flags); // Flags for the file open
-        printf("  fi->direct_io: %d\n", fi->direct_io); // Direct I/O flag
-        printf("  fi->keep_cache: %d\n", fi->keep_cache); // Cache keep flag
-        printf("  fi->writepage: %d\n", fi->writepage); // Pointer to writepage function (if any)
-    } else {
-        printf("[ERROR] fuse_file_info (fi) is NULL\n");
-    }
+    /*
+        // Print the contents of fuse_file_info (fi)
+        if (fi != NULL) {
+            printf("  fi->flags: %d\n", fi->flags); // Flags for the file open
+            printf("  fi->direct_io: %d\n", fi->direct_io); // Direct I/O flag
+            printf("  fi->keep_cache: %d\n", fi->keep_cache); // Cache keep flag
+            printf("  fi->writepage: %d\n", fi->writepage); // Pointer to writepage function (if any)
+        } else {
+            printf("[ERROR] fuse_file_info (fi) is NULL\n");
+        }
 
-    // Check if the buffer is NULL
-    if (buf == NULL) {
-        printf("[ERROR] Buffer is NULL\n");
-    } else {
-        printf("[DEBUG] Buffer pointer: %p\n", buf);
-    }
+        // Check if the buffer is NULL
+        if (buf == NULL) {
+            printf("[ERROR] Buffer is NULL\n");
+        } else {
+            printf("[DEBUG] Buffer pointer: %p\n", buf);
+        }
 
-    // Print the filler function pointer
-    //printf("[DEBUG] Filler function pointer: %p\n", filler);
-
-    // Special handling for the root directory
-    if (strcmp(path, "/") == 0)
-    {
-        printf("[DEBUG] Explicit handling for root directory\n");
-
-        // Add "." and ".." entries for root
-        filler(buf, ".", NULL, 0);  // Current directory
-        filler(buf, "..", NULL, 0); // Parent directory (same as root for "/")
-
-        // Retrieve the root inode
-        struct wfs_inode *root_inode = wfs_get_inode(ROOT_INODE_NUM);
-        if (root_inode == NULL)
+        // Print the filler function pointer
+        //printf("[DEBUG] Filler function pointer: %p\n", filler);
+        */
+    /*
+        // Special handling for the root directory
+        if (strcmp(path, "/") == 0)
         {
-            printf("[ERROR] Failed to retrieve root inode\n");
+            printf("[DEBUG] Explicit handling for root directory\n");
+
+            // Add "." and ".." entries for root
+            filler(buf, ".", NULL, 0);  // Current directory
+            filler(buf, "..", NULL, 0); // Parent directory (same as root for "/")
+
+            // Retrieve the root inode
+            struct wfs_inode *root_inode = wfs_get_inode(ROOT_INODE_NUM);
+            if (root_inode == NULL)
+            {
+                printf("[ERROR] Failed to retrieve root inode\n");
+                return -EIO; // Input/output error
+            }
+
+            printf("[DEBUG] Successfully retrieved root inode: mode=%d, size=%ld, nlinks=%d\n",
+                   root_inode->mode, root_inode->size, root_inode->nlinks);
+
+            // Read root directory entries
+            for (int i = 0; i < N_BLOCKS; i++)
+            {
+                if (root_inode->blocks[i] == 0)
+                {
+                    printf("[DEBUG] No more blocks to read for root directory.\n");
+                    break; // No more blocks
+                }
+
+                printf("[DEBUG] Reading root directory block %d at offset %ld\n", i, root_inode->blocks[i]);
+
+                struct wfs_dentry dir_entries[BLOCK_SIZE / sizeof(struct wfs_dentry)];
+                if (wfs_read_data_block(root_inode->blocks[i], dir_entries, sizeof(dir_entries)) != 0)
+                {
+                    printf("[ERROR] Failed to read root directory block %d\n", i);
+                    return -EIO; // Error reading data block
+                }
+
+                // Add valid entries to the buffer
+                for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
+                {
+                    if (dir_entries[j].num != 0) // Valid entry
+                    {
+                        printf("[DEBUG] Found directory entry: %s\n", dir_entries[j].name);
+                        filler(buf, dir_entries[j].name, NULL, 0);
+                    }
+                }
+            }
+
+            return 0; // Success
+        }
+
+        // General case for non-root directories
+        int inode_num = wfs_lookup(path);
+        if (inode_num < 0)
+        {
+            printf("[ERROR] Directory not found for path: %s\n", path);
+            return -ENOENT; // Directory not found
+        }
+
+        printf("[DEBUG] Found inode number %d for path: %s\n", inode_num, path);
+
+        struct wfs_inode *inode = wfs_get_inode(inode_num);
+        if (inode == NULL)
+        {
+            printf("[ERROR] Failed to retrieve inode for path: %s\n", path);
             return -EIO; // Input/output error
         }
 
-        printf("[DEBUG] Successfully retrieved root inode: mode=%d, size=%ld, nlinks=%d\n",
-               root_inode->mode, root_inode->size, root_inode->nlinks);
+        printf("[DEBUG] Retrieved inode: mode=%d, size=%ld, nlinks=%d\n",
+               inode->mode, inode->size, inode->nlinks);
 
-        // Read root directory entries
+        if (!(inode->mode & S_IFDIR))
+        {
+            printf("[ERROR] Path is not a directory: %s\n", path);
+            return -ENOTDIR; // Not a directory
+        }
+
+        filler(buf, ".", NULL, 0);  // Current directory
+        filler(buf, "..", NULL, 0); // Parent directory
+
         for (int i = 0; i < N_BLOCKS; i++)
         {
-            if (root_inode->blocks[i] == 0)
+            if (inode->blocks[i] == 0)
             {
-                printf("[DEBUG] No more blocks to read for root directory.\n");
+                printf("[DEBUG] No more blocks to read for directory inode %d.\n", inode_num);
                 break; // No more blocks
             }
 
-            printf("[DEBUG] Reading root directory block %d at offset %ld\n", i, root_inode->blocks[i]);
+            printf("[DEBUG] Reading directory block %d at offset %ld\n", i, inode->blocks[i]);
 
             struct wfs_dentry dir_entries[BLOCK_SIZE / sizeof(struct wfs_dentry)];
-            if (wfs_read_data_block(root_inode->blocks[i], dir_entries, sizeof(dir_entries)) != 0)
+            if (wfs_read_data_block(inode->blocks[i], dir_entries, sizeof(dir_entries)) != 0)
             {
-                printf("[ERROR] Failed to read root directory block %d\n", i);
+                printf("[ERROR] Failed to read directory block %d\n", i);
                 return -EIO; // Error reading data block
             }
 
-            // Add valid entries to the buffer
             for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
             {
                 if (dir_entries[j].num != 0) // Valid entry
@@ -1554,80 +1368,349 @@ static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
                 }
             }
         }
+    */
+    return 0; // Success
+}
 
-        return 0; // Success
+/**
+ * Splits a path into its parent directory and new entry name.
+ *
+ * @param path: The input path (e.g., "/home/user").
+ * @param parent_path: Buffer to hold the parent path (e.g., "/home").
+ * @param new_dir_name: Buffer to hold the new directory name (e.g., "user").
+ */
+void split_path(const char *path, char *parent_path, char *new_dir_name)
+{
+    printf("split_path: Splitting path '%s'\n", path);
+
+    const char *last_slash = strrchr(path, '/');
+    if (!last_slash || last_slash == path)
+    {
+        // Root case or single-level name
+        strncpy(parent_path, "/", 2);
+        strncpy(new_dir_name, path + 1, MAX_NAME); // Skip leading '/'
+    }
+    else
+    {
+        size_t parent_len = last_slash - path;
+        strncpy(parent_path, path, parent_len);
+        parent_path[parent_len] = '\0';
+        strncpy(new_dir_name, last_slash + 1, MAX_NAME);
     }
 
-    // General case for non-root directories
-    int inode_num = wfs_lookup(path);
-    if (inode_num < 0)
+    printf("split_path: Parent path = '%s', New name = '%s'\n", parent_path, new_dir_name);
+}
+
+/**
+ * Allocates an inode from the inode bitmap.
+ *
+ * @param sb: Pointer to the superblock.
+ * @return: The inode number of the newly allocated inode, or -1 if no inodes are available.
+ */
+/**
+ * Allocates an inode from the inode bitmap.
+ *
+ * @param sb: Pointer to the superblock.
+ * @return: The block number of the newly allocated block, or -1 if no blocks are available.
+ */
+int allocate_block(struct wfs_sb *sb)
+{
+    printf("[DEBUG] Entering allocate_block()\n");
+
+    // Use byte-level pointer arithmetic with explicit casting
+    uint8_t *block_bitmap = (uint8_t *)((char *)disk + sb->d_bitmap_ptr);
+
+    // Rest of the function remains the same
+    for (int i = 0; i < sb->num_data_blocks; i++)
     {
-        printf("[ERROR] Directory not found for path: %s\n", path);
-        return -ENOENT; // Directory not found
-    }
-
-    printf("[DEBUG] Found inode number %d for path: %s\n", inode_num, path);
-
-    struct wfs_inode *inode = wfs_get_inode(inode_num);
-    if (inode == NULL)
-    {
-        printf("[ERROR] Failed to retrieve inode for path: %s\n", path);
-        return -EIO; // Input/output error
-    }
-
-    printf("[DEBUG] Retrieved inode: mode=%d, size=%ld, nlinks=%d\n",
-           inode->mode, inode->size, inode->nlinks);
-
-    if (!(inode->mode & S_IFDIR))
-    {
-        printf("[ERROR] Path is not a directory: %s\n", path);
-        return -ENOTDIR; // Not a directory
-    }
-
-    filler(buf, ".", NULL, 0);  // Current directory
-    filler(buf, "..", NULL, 0); // Parent directory
-
-    for (int i = 0; i < N_BLOCKS; i++)
-    {
-        if (inode->blocks[i] == 0)
+        int byte_idx = i / 8;
+        int bit_idx = i % 8;
+        if (!(block_bitmap[byte_idx] & (1 << bit_idx))) // Free block found
         {
-            printf("[DEBUG] No more blocks to read for directory inode %d.\n", inode_num);
-            break; // No more blocks
+            printf("[DEBUG] Found free block at index: %d\n", i);
+            block_bitmap[byte_idx] |= (1 << bit_idx);
+            return i;
+        }
+    }
+
+    printf("[ERROR] No free blocks available\n");
+    return -ENOSPC;
+}
+
+/**
+ * Retrieves an inode by its number.
+ *
+ * @param sb: Pointer to the superblock.
+ * @param inode_num: The inode number to fetch.
+ * @return: Pointer to the inode structure.
+ */
+struct wfs_inode *get_inode(struct wfs_sb *sb, int inode_num)
+{
+    printf("get_inode: Fetching inode %d\n", inode_num);
+
+    if (inode_num < 0 || inode_num >= sb->num_inodes)
+    {
+        printf("get_inode: Invalid inode number %d\n", inode_num);
+        return NULL;
+    }
+
+    off_t inode_offset = sb->i_blocks_ptr + inode_num * BLOCK_SIZE;
+    return (struct wfs_inode *)((uint8_t *)disk + inode_offset);
+}
+
+/**
+ * Writes an inode back to disk.
+ *
+ * @param sb: Pointer to the superblock.
+ * @param inode: Pointer to the inode to write.
+ */
+void write_inode(struct wfs_sb *sb, struct wfs_inode *inode)
+{
+    printf("write_inode: Writing inode %d to disk\n", inode->num);
+
+    off_t inode_offset = sb->i_blocks_ptr + inode->num * BLOCK_SIZE;
+    struct wfs_inode *inode_on_disk = (struct wfs_inode *)((uint8_t *)disk + inode_offset);
+    *inode_on_disk = *inode; // Copy inode to its location on disk
+}
+
+/**
+ * Adds a directory entry to a parent directory.
+ *
+ * @param parent_inode: Pointer to the parent directory inode.
+ * @param new_entry: Pointer to the new directory entry.
+ * @return: 0 on success, -1 on failure.
+ */
+int add_dentry_to_directory(struct wfs_inode *parent_inode, struct wfs_dentry *new_entry)
+{
+    printf("add_dentry_to_directory: Adding entry '%s' to directory inode %d\n",
+           new_entry->name, parent_inode->num);
+
+    for (int i = 0; i < D_BLOCK; i++)
+    {
+        if (parent_inode->blocks[i] == 0)
+        {
+            // Allocate a new block if needed
+            int block_num = allocate_block(&sb);
+            if (block_num == -1)
+            {
+                printf("add_dentry_to_directory: No free blocks available\n");
+                return -1;
+            }
+
+            parent_inode->blocks[i] = block_num;
+            parent_inode->size += BLOCK_SIZE;
         }
 
-        printf("[DEBUG] Reading directory block %d at offset %ld\n", i, inode->blocks[i]);
+        // Load the block
+        struct wfs_dentry *entries = (struct wfs_dentry *)((uint8_t *)disk + parent_inode->blocks[i] * BLOCK_SIZE);
 
-        struct wfs_dentry dir_entries[BLOCK_SIZE / sizeof(struct wfs_dentry)];
-        if (wfs_read_data_block(inode->blocks[i], dir_entries, sizeof(dir_entries)) != 0)
-        {
-            printf("[ERROR] Failed to read directory block %d\n", i);
-            return -EIO; // Error reading data block
-        }
-
+        // Find an empty slot
         for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
         {
-            if (dir_entries[j].num != 0) // Valid entry
+            if (entries[j].num == 0) // Empty slot
             {
-                printf("[DEBUG] Found directory entry: %s\n", dir_entries[j].name);
-                filler(buf, dir_entries[j].name, NULL, 0);
+                entries[j] = *new_entry;
+                printf("add_dentry_to_directory: Added entry '%s' to block %ld, index %d\n",
+                       new_entry->name, parent_inode->blocks[i], j);
+                return 0;
             }
         }
     }
 
-    return 0; // Success
+    printf("add_dentry_to_directory: Directory is full\n");
+    return -1; // No space in directory
 }
 
+// // Function to create a new directory
+int wfs_mkdir(const char *path, mode_t mode)
+{
+    printf("[DEBUG] mkdir called for path: %s with mode: %o\n", path, mode);
+//     // Split the path into parent directory and new directory name
+//     char parent_path[MAX_NAME];
+//     char new_dir_name[MAX_NAME];
+//     split_path(path, parent_path, new_dir_name);
 
-static struct fuse_operations wfs_operations = {
-    .getattr = wfs_getattr,
-    .mknod = wfs_mknod,
-    .mkdir = wfs_mkdir,
-    .unlink = wfs_unlink,
-    .rmdir = wfs_rmdir,
-    .read = wfs_read,
-    .write = wfs_write,
-    .readdir = wfs_readdir,
-};
+//     // Resolve the parent inode
+//     struct wfs_inode *parent_inode = resolve_path_to_inode(parent_path);
+//     if (!parent_inode)
+//     {
+//         perror("Parent directory not found");
+//         return -ENOENT;
+//     }
+
+//     if (!S_ISDIR(parent_inode->mode))
+//     {
+//         perror("Parent is not a directory");
+//         return -ENOTDIR;
+//     }
+
+//     // Allocate a new inode for the directory
+//     //int new_inode_num = allocate_inode(sb);
+//     int new_inode_num = 0; //REMOVE after allocate_inode full implementation
+
+//     if (new_inode_num < 0)
+//     {
+//         perror("No free inodes available");
+//         return -ENOSPC;
+//     }
+
+//     struct wfs_inode *new_inode = get_inode(sb, new_inode_num);
+//     memset(new_inode, 0, sizeof(struct wfs_inode));
+
+//     new_inode->num = new_inode_num;
+//     new_inode->mode = S_IFDIR | mode;
+//     new_inode->size = BLOCK_SIZE;
+//     new_inode->nlinks = 2; // "." and parent directory
+
+//     time_t now = time(NULL);
+//     new_inode->atim = new_inode->mtim = new_inode->ctim = now;
+
+//     write_inode(sb, new_inode);
+
+//     // Allocate a block for the new directory's data
+//     int new_block_num = allocate_data_block(sb);
+//     if (new_block_num < 0)
+//     {
+//         perror("No free data blocks available");
+//         return -ENOSPC;
+//     }
+
+//     new_inode->blocks[0] = new_block_num;
+
+//     // Create "." and ".." entries
+//     struct wfs_dentry entries[2] = {
+//         {".", new_inode_num},
+//         {"..", parent_inode->num},
+//     };
+//     write_data_block(sb, new_block_num, entries);
+
+//     // Add the new directory entry to the parent directory
+//     struct wfs_dentry new_entry = {0};
+//     strncpy(new_entry.name, new_dir_name, MAX_NAME);
+//     new_entry.num = new_inode_num;
+//     add_dentry_to_directory(parent_inode, &new_entry);
+
+//     printf("[DEBUG] Directory created successfully: %s\n", path);
+     return 0; // Success
+}
+
+// Function to initialize the memory-mapped disk
+void initialize_disk(const char *disk_image_path)
+{
+    disk_fd = open(disk_image_path, O_RDWR);
+    if (disk_fd < 0)
+    {
+        perror("[ERROR] Failed to open disk image");
+        exit(EXIT_FAILURE);
+    }
+
+    // Memory-map the disk
+    disk = mmap(NULL, disk_size, PROT_READ | PROT_WRITE, MAP_SHARED, disk_fd, 0);
+    if (disk == MAP_FAILED)
+    {
+        perror("[ERROR] Failed to map disk image to memory");
+        close(disk_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    // Set the superblock pointer
+    superblock = (struct wfs_sb *)disk;
+
+    printf("[INFO] Disk image mapped to memory at %p\n", disk);
+    printf("[INFO] Superblock loaded: num_inodes=%zu, num_data_blocks=%zu, raid_mode=%d\n",
+           superblock->num_inodes, superblock->num_data_blocks, superblock->raid_mode);
+}
+
+// Function to find the first free bit in a bitmap
+int find_free_bit(void *bitmap, size_t count)
+{
+    uint8_t *byte_array = (uint8_t *)bitmap;
+    for (size_t i = 0; i < count; i++)
+    {
+        size_t byte_idx = i / 8;
+        size_t bit_idx = i % 8;
+        if (!(byte_array[byte_idx] & (1 << bit_idx)))
+        {
+            return i; // Free bit found
+        }
+    }
+    return -1; // No free bit found
+}
+
+// Function to set a bit in a bitmap
+void set_bit(void *bitmap, int bit)
+{
+    uint8_t *byte_array = (uint8_t *)bitmap;
+    size_t byte_idx = bit / 8;
+    size_t bit_idx = bit % 8;
+    byte_array[byte_idx] |= (1 << bit_idx);
+}
+
+// Function to allocate the root inode
+int allocate_root_inode()
+{
+    printf("[DEBUG] Allocating root inode...\n");
+
+    // Step 1: Locate a free inode (use char * for byte-level arithmetic)
+    void *i_bitmap = (void *)((char *)disk + superblock->i_bitmap_ptr);
+    int root_inode_num = find_free_bit(i_bitmap, superblock->num_inodes);
+    if (root_inode_num < 0)
+    {
+        fprintf(stderr, "[ERROR] No free inodes available\n");
+        return -1;
+    }
+    printf("[INFO] Found free inode at index %d\n", root_inode_num);
+    set_bit(i_bitmap, root_inode_num);
+
+    // Step 2: Allocate a data block for the root directory
+    void *d_bitmap = (void *)((char *)disk + superblock->d_bitmap_ptr);
+    int data_block_num = find_free_bit(d_bitmap, superblock->num_data_blocks);
+    if (data_block_num < 0)
+    {
+        fprintf(stderr, "[ERROR] No free data blocks available\n");
+        return -1;
+    }
+    printf("[INFO] Found free data block at index %d\n", data_block_num);
+    set_bit(d_bitmap, data_block_num);
+
+    // Step 3: Initialize root inode
+    struct wfs_inode *root_inode = (struct wfs_inode *)((char *)disk +
+                                                        superblock->i_blocks_ptr + (size_t)root_inode_num * BLOCK_SIZE);
+    memset(root_inode, 0, sizeof(*root_inode));
+    root_inode->num = root_inode_num;
+    root_inode->mode = S_IFDIR | 0755; // Directory with rwxr-xr-x permissions
+    root_inode->uid = 0;
+    root_inode->gid = 0;
+    root_inode->size = BLOCK_SIZE;
+    root_inode->nlinks = 2; // "." and ".."
+    root_inode->atim = root_inode->mtim = root_inode->ctim = time(NULL);
+    root_inode->blocks[0] = superblock->d_blocks_ptr + (size_t)data_block_num * BLOCK_SIZE;
+
+    // Step 4: Initialize directory entries
+    struct wfs_dentry *dir_entries = (struct wfs_dentry *)((char *)disk + root_inode->blocks[0]);
+    strcpy(dir_entries[0].name, ".");
+    dir_entries[0].num = root_inode_num;
+    strcpy(dir_entries[1].name, "..");
+    dir_entries[1].num = root_inode_num;
+    printf("[INFO] Root inode and directory entries initialized\n");
+
+    return 0;
+}
+
+// Function to print the contents of the disk for debugging
+void print_disk_contents()
+{
+    printf("[DEBUG] Printing disk contents:\n");
+    for (size_t i = 0; i < disk_size; i += BLOCK_SIZE)
+    {
+        printf("Block %zu: ", i / BLOCK_SIZE);
+        for (size_t j = 0; j < BLOCK_SIZE; j++)
+        {
+            //printf("%02x ", ((uint8_t *)disk)[i + j]);
+        }
+        //printf("\n");
+    }
+}
 
 // Function to parse and separate arguments
 int parse_arguments(int argc, char *argv[], char *disks[], int *disk_count, char **mount_point, char *fuse_argv[], int *fuse_argc)
@@ -1701,48 +1784,35 @@ int parse_arguments(int argc, char *argv[], char *disks[], int *disk_count, char
     return 0;
 }
 
+// Main function
 int main(int argc, char *argv[])
 {
-    char *fuse_argv[argc + 1];
+    char *fuse_argv[argc + 2]; // +2 to handle mount_point and NULL terminator
     int fuse_argc = 0;
 
-    // Parse arguments
-    if (parse_arguments(argc, argv, disks, &disk_count, &mount_point, fuse_argv, &fuse_argc) != 0)
+    //Parse arguments
+    if (parse_arguments(argc, argv, disks, &disk_count, &mount_point, fuse_argv, &fuse_argc) < 0)
     {
         return EXIT_FAILURE;
     }
 
-    // Open the disks
+    printf("[INFO] Disks parsed: ");
     for (int i = 0; i < disk_count; i++)
     {
-        disk_fds[i] = open(disks[i], O_RDWR);
-        if (disk_fds[i] < 0)
-        {
-            perror("[ERROR] Failed to open disk");
-            return EXIT_FAILURE;
-        }
+        printf("%s ", disks[i]);
     }
+    printf("\n[INFO] Mount point: %s\n", mount_point);
 
-    // Read the superblock from the first disk
-    printf("[DEBUG] Attempting to read superblock from disk 0\n");
-    if (pread(disk_fds[0], &sb, sizeof(sb), 0) != sizeof(sb))
-    {
-        perror("[ERROR] Failed to read superblock");
-        return EXIT_FAILURE;
-    }
-
-    // Now that the superblock is read, set the global superblock pointer
-    superblock = &sb; // Point to the superblock read from disk
-
-    // Verify that the superblock was read correctly
-    printf("[DEBUG] Superblock read successfully. RAID Mode: %d, Number of disks: %d\n", sb.raid_mode, sb.num_disks);
+    // Initialize the disks (only the first disk is mapped in this example)
+    initialize_disk(disks[0]);
 
     // Check and allocate root inode if necessary
-    printf("[DEBUG] Checking if root inode is allocated\n");
-    int root_inode_check = find_free_bit_root(sb.i_bitmap_ptr, sb.num_inodes, disk_fds[0]);
+    printf("[DEBUG] Checking if root inode is allocated...\n");
+    void *i_bitmap = (void *)((char *)disk + superblock->i_bitmap_ptr);
+    int root_inode_check = find_free_bit(i_bitmap, superblock->num_inodes);
     if (root_inode_check == 0)
     {
-        printf("[INFO] Allocating root inode\n");
+        printf("[INFO] Allocating root inode...\n");
         if (allocate_root_inode() != 0)
         {
             fprintf(stderr, "[ERROR] Failed to allocate root inode\n");
@@ -1754,181 +1824,22 @@ int main(int argc, char *argv[])
         printf("[INFO] Root inode already allocated\n");
     }
 
-    // Start the FUSE main loop
-    printf("[DEBUG] Starting FUSE main loop\n");
-    return fuse_main(fuse_argc, fuse_argv, &wfs_operations, NULL);
-}
+    // Print disk contents (optional, for debugging)
+    print_disk_contents();
 
+    // Start FUSE main loop
+    printf("[DEBUG] Starting FUSE main loop...\n");
+    int result = fuse_main(fuse_argc, fuse_argv, &wfs_operations, NULL);
 
-int find_free_bit_root(off_t bitmap_ptr, size_t count, int disk_fd)
-{
-    uint8_t buffer[BLOCK_SIZE];
-    if (pread(disk_fd, buffer, BLOCK_SIZE, bitmap_ptr) != BLOCK_SIZE)
+    // Cleanup
+    if (munmap(disk, disk_size) < 0)
     {
-        perror("[ERROR] Failed to read bitmap");
-        return -EIO;
-    }
-
-    for (size_t i = 0; i < count; i++)
-    {
-        size_t byte_idx = i / 8;
-        size_t bit_idx = i % 8;
-
-        if (!(buffer[byte_idx] & (1 << bit_idx))) // Free bit found
-        {
-            return i;
-        }
-    }
-
-    return -1; // No free bit found
-}
-
-int set_bit_root(off_t bitmap_ptr, int bit, int disk_fd)
-{
-    uint8_t buffer[BLOCK_SIZE];
-    if (pread(disk_fd, buffer, BLOCK_SIZE, bitmap_ptr) != BLOCK_SIZE)
-    {
-        perror("[ERROR] Failed to read bitmap");
-        return -EIO;
-    }
-
-    size_t byte_idx = bit / 8;
-    size_t bit_idx = bit % 8;
-    buffer[byte_idx] |= (1 << bit_idx); // Set the bit
-
-    if (pwrite(disk_fd, buffer, BLOCK_SIZE, bitmap_ptr) != BLOCK_SIZE)
-    {
-        perror("[ERROR] Failed to update bitmap");
-        return -EIO;
-    }
-
-    return 0;
-}
-
-int read_superblock(FILE *disk, struct wfs_sb *sb)
-{
-    // Seek to the start of the disk (superblock is at offset 0)
-    fseek(disk, 0, SEEK_SET);
-
-    // Read the superblock data
-    size_t bytes_read = fread(sb, sizeof(struct wfs_sb), 1, disk);
-
-    if (bytes_read != 1)
-    {
-        fprintf(stderr, "[ERROR] Failed to read the superblock.\n");
-        return -1; // Return an error if reading failed
-    }
-
-    return EXIT_SUCCESS; // Success
-}
-
-int initialize_raid(int raid_mode, char *disks[], int disk_count)
-{
-    printf("[INFO] Initializing RAID mode: %d\n", raid_mode);
-
-    FILE *disk = fopen(disks[0], "rb");
-    if (!disk)
-    {
-        fprintf(stderr, "[ERROR] Failed to open disk: %s\n", disks[0]);
+        perror("[ERROR] Failed to unmap disk");
         return EXIT_FAILURE;
     }
+    close(disk_fd);
 
-    struct wfs_sb sb;
-
-    // Read the superblock from the disk
-    if (read_superblock(disk, &sb) != 0)
-    {
-        fclose(disk);
-        return EXIT_FAILURE;
-    }
-
-    printf("[INFO] RAID mode from superblock: %d\n", sb.raid_mode);
-
-    fclose(disk);
-
-    if (sb.raid_mode == 0)
-    {
-        printf("[INFO] RAID 0 configuration.\n");
-    }
-    else if (sb.raid_mode == 1)
-    {
-        printf("[INFO] RAID 1 configuration.\n");
-    }
-    else if (sb.raid_mode == 2)
-    {
-        printf("[INFO] RAID 1v configuration.\n");
-    }
-    else
-    {
-        fprintf(stderr, "[ERROR] Invalid RAID mode in superblock: %d\n", sb.raid_mode);
-        return EXIT_FAILURE;
-    }
-
-    printf("[INFO] RAID initialized successfully.\n");
-    return EXIT_SUCCESS;
-}
-
-// Function to retrieve RAID mode from the superblock
-int retrieve_raid_mode(const char *disk_path)
-{
-    // Open the disk file
-    FILE *disk = fopen(disk_path, "rb");
-    if (!disk)
-    {
-        fprintf(stderr, "[ERROR] Failed to open disk: %s\n", disk_path);
-        exit(EXIT_FAILURE); // Exit if the disk can't be opened
-    }
-
-    struct wfs_sb sb;
-    // Read the superblock from the disk
-    printf("[DEBUG] Reading superblock from disk...\n");
-    if (read_superblock(disk, &sb) != 0)
-    {
-        fclose(disk);
-        exit(EXIT_FAILURE); // Exit if reading superblock fails
-    }
-
-    // Set RAID mode from superblock (global variable)
-    printf("RAID found: %d\n", sb.raid_mode);
-    raid_mode = sb.raid_mode;
-    printf("[INFO] Retrieved RAID mode from superblock: %d\n", raid_mode);
-
-    fclose(disk); // Close the disk file after reading the superblock
-
-    if (raid_mode < 0 || raid_mode > 2)
-    {
-        fprintf(stderr, "[ERROR] Invalid RAID mode in superblock: %d\n", raid_mode);
-        return EXIT_FAILURE;
-    }
-
-    printf("[INFO] Retrieved RAID mode from superblock: %d\n", raid_mode);
-    return EXIT_SUCCESS;
-}
-
-int prepare_fuse_args(int argc, char *argv[], int disk_count, char *fuse_argv[], int *fuse_argc)
-{
-    printf("[DEBUG] Preparing FUSE arguments...\n");
-    *fuse_argc = 0;
-
-    // Add program name (argv[0]) to FUSE arguments
-    fuse_argv[(*fuse_argc)++] = argv[0];
-
-    // Find and copy FUSE options (everything after "-s" and the mount point)
-    for (int i = 1 + disk_count; i < argc; i++)
-    {
-        fuse_argv[(*fuse_argc)++] = argv[i];
-    }
-
-    // Ensure the array is null-terminated (FUSE expects this)
-    fuse_argv[*fuse_argc] = NULL;
-
-    // Debug output for FUSE arguments
-    for (int i = 0; i < *fuse_argc; i++)
-    {
-        printf("[DEBUG] fuse_argv[%d]: %s\n", i, fuse_argv[i]);
-    }
-
-    return EXIT_SUCCESS;
+    return result;
 }
 
 // Function to check and validate parameters
@@ -2044,4 +1955,130 @@ void validate_raid_config(int raid_mode, int disk_count)
         fprintf(stderr, "[ERROR] RAID 0 requires at least 2 disks.\n");
         exit(EXIT_FAILURE);
     }
+}
+
+int prepare_fuse_args(int argc, char *argv[], int disk_count, char *fuse_argv[], int *fuse_argc)
+{
+    printf("[DEBUG] Preparing FUSE arguments...\n");
+    *fuse_argc = 0;
+
+    // Add program name (argv[0]) to FUSE arguments
+    fuse_argv[(*fuse_argc)++] = argv[0];
+
+    // Find and copy FUSE options (everything after "-s" and the mount point)
+    for (int i = 1 + disk_count; i < argc; i++)
+    {
+        fuse_argv[(*fuse_argc)++] = argv[i];
+    }
+
+    // Ensure the array is null-terminated (FUSE expects this)
+    fuse_argv[*fuse_argc] = NULL;
+
+    // Debug output for FUSE arguments
+    for (int i = 0; i < *fuse_argc; i++)
+    {
+        printf("[DEBUG] fuse_argv[%d]: %s\n", i, fuse_argv[i]);
+    }
+
+    return EXIT_SUCCESS;
+}
+
+// Function to retrieve RAID mode from the superblock
+int retrieve_raid_mode(const char *disk_path)
+{
+    // Open the disk file
+    FILE *disk = fopen(disk_path, "rb");
+    if (!disk)
+    {
+        fprintf(stderr, "[ERROR] Failed to open disk: %s\n", disk_path);
+        exit(EXIT_FAILURE); // Exit if the disk can't be opened
+    }
+
+    struct wfs_sb sb;
+    // Read the superblock from the disk
+    printf("[DEBUG] Reading superblock from disk...\n");
+    if (read_superblock(disk, &sb) != 0)
+    {
+        fclose(disk);
+        exit(EXIT_FAILURE); // Exit if reading superblock fails
+    }
+
+    // Set RAID mode from superblock (global variable)
+    printf("RAID found: %d\n", sb.raid_mode);
+    raid_mode = sb.raid_mode;
+    printf("[INFO] Retrieved RAID mode from superblock: %d\n", raid_mode);
+
+    fclose(disk); // Close the disk file after reading the superblock
+
+    if (raid_mode < 0 || raid_mode > 2)
+    {
+        fprintf(stderr, "[ERROR] Invalid RAID mode in superblock: %d\n", raid_mode);
+        return EXIT_FAILURE;
+    }
+
+    printf("[INFO] Retrieved RAID mode from superblock: %d\n", raid_mode);
+    return EXIT_SUCCESS;
+}
+
+int initialize_raid(int raid_mode, char *disks[], int disk_count)
+{
+    printf("[INFO] Initializing RAID mode: %d\n", raid_mode);
+
+    FILE *disk = fopen(disks[0], "rb");
+    if (!disk)
+    {
+        fprintf(stderr, "[ERROR] Failed to open disk: %s\n", disks[0]);
+        return EXIT_FAILURE;
+    }
+
+    struct wfs_sb sb;
+
+    // Read the superblock from the disk
+    if (read_superblock(disk, &sb) != 0)
+    {
+        fclose(disk);
+        return EXIT_FAILURE;
+    }
+
+    printf("[INFO] RAID mode from superblock: %d\n", sb.raid_mode);
+
+    fclose(disk);
+
+    if (sb.raid_mode == 0)
+    {
+        printf("[INFO] RAID 0 configuration.\n");
+    }
+    else if (sb.raid_mode == 1)
+    {
+        printf("[INFO] RAID 1 configuration.\n");
+    }
+    else if (sb.raid_mode == 2)
+    {
+        printf("[INFO] RAID 1v configuration.\n");
+    }
+    else
+    {
+        fprintf(stderr, "[ERROR] Invalid RAID mode in superblock: %d\n", sb.raid_mode);
+        return EXIT_FAILURE;
+    }
+
+    printf("[INFO] RAID initialized successfully.\n");
+    return EXIT_SUCCESS;
+}
+
+int read_superblock(FILE *disk, struct wfs_sb *sb)
+{
+    // Seek to the start of the disk (superblock is at offset 0)
+    fseek(disk, 0, SEEK_SET);
+
+    // Read the superblock data
+    size_t bytes_read = fread(sb, sizeof(struct wfs_sb), 1, disk);
+
+    if (bytes_read != 1)
+    {
+        fprintf(stderr, "[ERROR] Failed to read the superblock.\n");
+        return -1; // Return an error if reading failed
+    }
+
+    return EXIT_SUCCESS; // Success
 }
