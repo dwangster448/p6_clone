@@ -33,19 +33,20 @@ char *mount_point = NULL;
 void *disk;
 
 // Helper functions prototypes
-int inspect_disk(char *disk_path, int index);
+int check_disk(char *disk_path, int index);
 int find_free(int is_inode);
-void mirror_inode(int inode_num, struct wfs_inode *source_inode);
+void copy_disk(int inode_num, struct wfs_inode *source_inode);
 int find_dir_block(struct wfs_inode *dir_inode);
 void add_dir_entry(int block_num, const char *filename, int inode_num);
-off_t get_block_number(struct wfs_inode *inode, int index);
-int set_block_number(struct wfs_inode *inode, int index, off_t block_num);
+off_t get_block_num(struct wfs_inode *inode, int index);
+int set_block_num(struct wfs_inode *inode, int index, off_t block_num);
 void write_block(int block_num, const char *data, size_t offset, size_t size);
 char *get_block_addr(int block_num);
 char *find_majority();
 int remove_dentry(struct wfs_inode *dir_inode, const char *filename);
 void free_inode_and_blocks(struct wfs_inode *inode, int inode_num);
 void clear_bitmap_bit(off_t bitmap_offset, int item_num);
+
 
 int wfs_getattr(const char *path, struct stat *stbuf);
 int wfs_mknod(const char *path, mode_t mode, dev_t dev);
@@ -107,7 +108,7 @@ int wfs_mknod(const char *path, mode_t mode, dev_t dev)
     }
 
     // Mirror inode to all disks
-    mirror_inode(new_inum, new_inode);
+    copy_disk(new_inum, new_inode);
     struct wfs_inode *parent_inode = (struct wfs_inode *)((char *)disk_maps[0] + sb->i_blocks_ptr + parent_inum * BLOCK_SIZE);
 
     // find block for new entry
@@ -124,7 +125,7 @@ int wfs_mknod(const char *path, mode_t mode, dev_t dev)
     parent_inode->ctim = parent_inode->mtim;
 
     // mirror parent inode to all disk
-    mirror_inode(parent_inum, parent_inode);
+    copy_disk(parent_inum, parent_inode);
     free(path_copy);
 
     return EXIT_SUCCESS; // Success
@@ -221,7 +222,7 @@ int wfs_rmdir(const char *path)
     parent_inode->size -= sizeof(struct wfs_dentry);
     parent_inode->mtim = time(NULL);
     parent_inode->ctim = parent_inode->mtim;
-    mirror_inode(parent_inum, parent_inode);
+    copy_disk(parent_inum, parent_inode);
 
     free(path_copy);
 
@@ -295,7 +296,7 @@ int wfs_write(const char *path, const char *buf, size_t size, off_t offset, stru
     while (bytes_written < size)
     {
         // Get current block number
-        off_t curr_block = get_block_number(inode, start_block);
+        off_t curr_block = get_block_num(inode, start_block);
 
         // Allocate new block if needed
         if (curr_block == -1)
@@ -305,7 +306,7 @@ int wfs_write(const char *path, const char *buf, size_t size, off_t offset, stru
             {
                 break;
             }
-            if (set_block_number(inode, start_block, new_block) < 0)
+            if (set_block_num(inode, start_block, new_block) < 0)
             {
                 break;
             }
@@ -337,7 +338,7 @@ int wfs_write(const char *path, const char *buf, size_t size, off_t offset, stru
 
     inode->mtim = time(NULL);
     inode->ctim = inode->mtim;
-    mirror_inode(inum, inode);
+    copy_disk(inum, inode);
 
     return bytes_written;
 }
@@ -347,17 +348,17 @@ int wfs_write(const char *path, const char *buf, size_t size, off_t offset, stru
 //  */
 int wfs_getattr(const char *path, struct stat *stbuf)
 {
-    fprintf(logfp, "GOT INTO GETATTR");
+    fprintf(logfp, "Entering getattr ----------\n");
     fflush(logfp);
 
     memset(stbuf, 0, sizeof(struct stat));
-    fprintf(logfp, "GETATTR called for path: %s\n", path);
+    fprintf(logfp, "Path: %s\n", path);
     fflush(logfp);
 
     int inode_num = find_inode(path);
     if (inode_num < 0)
     {
-        fprintf(logfp, "GETATTR: Path not found, returning -ENOENT\n");
+        fprintf(logfp, "getattr: Path not found, returning -ENOENT\n");
         fflush(logfp);
         return -ENOENT;
     }
@@ -366,7 +367,7 @@ int wfs_getattr(const char *path, struct stat *stbuf)
     struct wfs_inode *inode = (struct wfs_inode *)((char *)disk_maps[0] +
                                                    sb->i_blocks_ptr + (inode_num * BLOCK_SIZE));
 
-    fprintf(logfp, "GETATTR: Found inode number: %d\n", inode_num);
+    fprintf(logfp, "getattr: Inode number: %d\n", inode_num);
     fflush(logfp);
 
     // Fill stat buffer
@@ -375,6 +376,7 @@ int wfs_getattr(const char *path, struct stat *stbuf)
     stbuf->st_uid = inode->uid;
     stbuf->st_gid = inode->gid;
     stbuf->st_size = inode->size;
+
     stbuf->st_atim.tv_sec = inode->atim;
     stbuf->st_atim.tv_nsec = 0;
     stbuf->st_mtim.tv_sec = inode->mtim;
@@ -382,9 +384,9 @@ int wfs_getattr(const char *path, struct stat *stbuf)
     stbuf->st_ctim.tv_sec = inode->ctim;
     stbuf->st_ctim.tv_nsec = 0;
 
-    fprintf(logfp, "GETATTR: Retrieved attributes - mode: %o, nlink: %u, uid: %d, gid: %d, size: %ld\n",
+    fprintf(logfp, "getattr: Retrieved attributes - mode: %o, nlink: %u, uid: %d, gid: %d, size: %ld\n",
             inode->mode, inode->nlinks, inode->uid, inode->gid, inode->size);
-    fprintf(logfp, "GETATTR: Timestamps - atime: %ld, mtime: %ld, ctime: %ld\n",
+    fprintf(logfp, "getattr: Timestamps - atime: %ld, mtime: %ld, ctime: %ld\n",
             inode->atim, inode->mtim, inode->ctim);
     fflush(logfp);
 
@@ -538,9 +540,9 @@ int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offse
  * @param parent_path: Buffer to hold the parent path (e.g., "/home").
  * @param new_dir_name: Buffer to hold the new directory name (e.g., "user").
  */
-void split_path(const char *path, char *parent_path, char *new_dir_name)
+void get_path(const char *path, char *parent_path, char *new_dir_name)
 {
-    printf("split_path: Splitting path '%s'\n", path);
+    printf("get_path: Splitting path '%s'\n", path);
 
     const char *last_slash = strrchr(path, '/');
     if (!last_slash || last_slash == path)
@@ -557,57 +559,60 @@ void split_path(const char *path, char *parent_path, char *new_dir_name)
         strncpy(new_dir_name, last_slash + 1, MAX_NAME);
     }
 
-    printf("split_path: Parent path = '%s', New name = '%s'\n", parent_path, new_dir_name);
+    printf("get_path: Parent path = '%s', New name = '%s'\n", parent_path, new_dir_name);
 }
 
 // // Function to create a new directory
 int wfs_mkdir(const char *path, mode_t mode)
 {
     fprintf(logfp, "[DEBUG] mkdir called for path: %s with mode: %o\n", path, mode);
-
     fflush(logfp);
+
     char *path_copy = strdup(path);
     char *last_slash = strrchr(path_copy, '/');
     *last_slash = '\0';
     char *parent_path = path_copy;
     char *dirname = last_slash + 1;
 
-    fprintf(logfp, "Path copied\n");
+    fprintf(logfp, "Copied path\n");
     fflush(logfp);
 
-    fprintf(logfp, "Split path: parent=%s, name=%s\n", parent_path, dirname);
+    fprintf(logfp, "Split path: parent=%s, name=%s\n", parent_path, dirname); // TODO HWAT IS THIS
     fflush(logfp);
 
     if (parent_path[0] == '\0')
     {
         parent_path = "/";
-        fprintf(logfp, "Using root as parent\n");
+        fprintf(logfp, "Parent path is null, using root as parent\n");
         fflush(logfp);
     }
 
     int parent_inum = find_inode(parent_path);
-    fprintf(logfp, "Parent inode result: %d\n", parent_inum);
+    fprintf(logfp, "Parent inode number = %d\n", parent_inum);
     fflush(logfp);
 
     if (parent_inum < 0)
     {
-        fprintf(logfp, "fail1");
+        fprintf(logfp, "Invalid parent inode number\n");
         free(path_copy);
         return -ENOENT;
     }
 
     int new_inum = find_free(1);
-    fprintf(logfp, "new inode result: %d\n", new_inum);
+    fprintf(logfp, "New Inode's number = %d\n", new_inum);
     fflush(logfp);
 
     if (new_inum < 0)
     {
-        fprintf(logfp, "fail2");
+        fprintf(logfp, "Invalid new Inode number");
         free(path_copy);
         return -ENOSPC;
     }
 
+        // Calculating location of new inode
     struct wfs_inode *new_inode = (struct wfs_inode *)((char *)disk_maps[0] + sb->i_blocks_ptr + (new_inum * BLOCK_SIZE));
+
+        // Initializing all fields witin the new inode
     new_inode->num = new_inum;
     new_inode->mode = S_IFDIR | mode; // Directory type + permissions
     new_inode->uid = getuid();
@@ -618,15 +623,19 @@ int wfs_mkdir(const char *path, mode_t mode)
     new_inode->mtim = new_inode->atim;
     new_inode->ctim = new_inode->atim;
 
+        // Setting all data blocks to -1, indicates uninitialized
     for (int i = 0; i < N_BLOCKS; i++)
     {
         new_inode->blocks[i] = -1;
     }
 
-    mirror_inode(new_inum, new_inode);
+    copy_disk(new_inum, new_inode); // Copy metadata over to all disks regardless of RAID
+        // TODO where is bitmap being excluded??? CHeck whatsapp for reference
 
+        // Calculating location of parent inode
     struct wfs_inode *parent_inode = (struct wfs_inode *)((char *)disk_maps[0] + sb->i_blocks_ptr + parent_inum * BLOCK_SIZE);
 
+        // Attempting to
     int parent_block = find_dir_block(parent_inode);
     if (parent_block < 0)
     {
@@ -641,7 +650,7 @@ int wfs_mkdir(const char *path, mode_t mode)
     parent_inode->ctim = parent_inode->mtim;
     parent_inode->size += sizeof(struct wfs_dentry);
 
-    mirror_inode(parent_inum, parent_inode);
+    copy_disk(parent_inum, parent_inode);
 
     fprintf(logfp, "MKDIR finished\n");
     fflush(logfp);
@@ -701,7 +710,7 @@ int main(int argc, char *argv[])
 
     for (int j = 0; j < num_disks; j++)
     {
-        if (inspect_disk(disk_paths[j], j) != 0)
+        if (check_disk(disk_paths[j], j) != 0)
         {
             for (int k = 0; k < j; k++)
             {
@@ -739,7 +748,7 @@ int main(int argc, char *argv[])
     return fuse_main(fuse_argc, fuse_argv, &wfs_operations, NULL);
 }
 
-int inspect_disk(char *disk_path, int index)
+int check_disk(char *disk_path, int index)
 {
     printf("Opening file: %s at index %d\n", disk_path, index);
     int fd = open(disk_path, O_RDWR, 0777);
@@ -938,19 +947,143 @@ int find_free(int is_inode)
     return -1;
 }
 
-void mirror_inode(int inode_num, struct wfs_inode *source_inode)
+void copy_disk(int inode_num, struct wfs_inode *source_inode)
 {
     // Mirror to ALL disks
     for (int disk = 0; disk < num_disks; disk++)
     {
-        void *mirror_inode = (void *)((char *)disk_maps[disk] + sb->i_blocks_ptr + inode_num * BLOCK_SIZE);
-        memcpy(mirror_inode, source_inode, BLOCK_SIZE);
+        void *copy_disk = (void *)((char *)disk_maps[disk] + sb->i_blocks_ptr + inode_num * BLOCK_SIZE);
+        memcpy(copy_disk, source_inode, BLOCK_SIZE);
     }
 }
 
+int cfree_entry_r0(int block_num) {
+    fprintf(logfp, "Checking block %d (RAID 0)\n", block_num);
+    fflush(logfp);
+
+    int disk_num = block_num % num_disks;
+    int block_offset = block_num / num_disks;
+    struct wfs_dentry *entries = (struct wfs_dentry *)((char *)disk_maps[disk_num] +
+                                                       sb->d_blocks_ptr + block_offset * BLOCK_SIZE);
+
+    for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
+        fprintf(logfp, "Checking entry %d: num=%d\n", j, entries[j].num);
+        fflush(logfp);
+        if (entries[j].num == -1) {
+            fprintf(logfp, "Found free entry in existing block (RAID 0)\n");
+            fflush(logfp);
+            return 1; // Found free entry
+        }
+    }
+    return 0; // No free entry found
+}
+
+int cfree_entry_r1(int block_num) {
+    fprintf(logfp, "Checking block %d (RAID 1)\n", block_num);
+    fflush(logfp);
+
+    struct wfs_dentry *entries = (struct wfs_dentry *)((char *)disk_maps[0] +
+                                                       sb->d_blocks_ptr + block_num * BLOCK_SIZE);
+
+    for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
+        fprintf(logfp, "Checking entry %d: num=%d\n", j, entries[j].num);
+        fflush(logfp);
+        if (entries[j].num == -1) {
+            fprintf(logfp, "Found free entry in existing block (RAID 1)\n");
+            fflush(logfp);
+            return 1; // Found free entry
+        }
+    }
+    return 0; // No free entry found
+}
+
+void init_new_r0(int new_block) {
+    fprintf(logfp, "Initializing new block %d (RAID 0)\n", new_block);
+    fflush(logfp);
+
+    int disk_num = new_block % num_disks;
+    int block_offset = new_block / num_disks;
+    struct wfs_dentry *entries = (struct wfs_dentry *)((char *)disk_maps[disk_num] +
+                                                       sb->d_blocks_ptr + block_offset * BLOCK_SIZE);
+
+    for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
+        entries[j].num = -1;       // Mark as free
+        entries[j].name[0] = '\0'; // Clear name
+    }
+}
+
+void init_new_r1(int new_block) {
+    fprintf(logfp, "Initializing new block %d (RAID 1)\n", new_block);
+    fflush(logfp);
+
+    for (int disk = 0; disk < num_disks; disk++) {
+        struct wfs_dentry *entries = (struct wfs_dentry *)((char *)disk_maps[disk] +
+                                                           sb->d_blocks_ptr + new_block * BLOCK_SIZE);
+        for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
+            entries[j].num = -1;       // Mark as free
+            entries[j].name[0] = '\0'; // Clear name
+        }
+    }
+}
+
+int find_dir_block(struct wfs_inode *dir_inode) {
+    fprintf(logfp, "Entering find_dir_block -------------\n");
+    fflush(logfp);
+
+    // Check all existing blocks
+    for (int i = 0; i < N_BLOCKS && dir_inode->blocks[i] != -1; i++) {
+        int block_num = dir_inode->blocks[i];
+
+        // Check for free entry in the block based on RAID mode
+        int free_entry_found = 0;
+        if (sb->raid_mode == 0) {
+            free_entry_found = cfree_entry_r0(block_num); // RAID 0
+        } else {
+            free_entry_found = cfree_entry_r1(block_num); // RAID 1
+        }
+
+        if (free_entry_found) {
+            return block_num; // Found block with free entry
+        }
+    }
+
+    // No free entry found in existing blocks, find first empty block slot
+    fprintf(logfp, "No free entries found, allocating new block\n");
+    fflush(logfp);
+
+    for (int i = 0; i < N_BLOCKS; i++) {
+        fprintf(logfp, "Index = %d, Block = %ld\n", i, dir_inode->blocks[i]);
+        if (dir_inode->blocks[i] == -1) {
+            // Allocate new block
+            int new_block = find_free(0);
+            if (new_block < 0) {
+                return -1; // Directory is full or allocation failed
+            }
+
+            // Initialize the new block based on RAID mode
+            if (sb->raid_mode == 0) {
+                init_new_r0(new_block); // RAID 0
+            } else {
+                init_new_r1(new_block); // RAID 1
+            }
+
+            // Assign the new block to the directory inode
+            dir_inode->blocks[i] = new_block;
+            fprintf(logfp, "New block allocated and initialized\n");
+            fflush(logfp);
+            return new_block;
+        }
+    }
+
+    fprintf(logfp, "Directory is full\n");
+    fflush(logfp);
+    return -1; // Directory is full (no more block slots)
+}
+
+/*
 int find_dir_block(struct wfs_inode *dir_inode)
 {
-    fprintf(logfp, "Starting find_dir_block\n");
+    fprintf(logfp, "Entering find_dir_block -------------\n");
     fflush(logfp);
 
     // Check all existing blocks
@@ -1058,7 +1191,7 @@ int find_dir_block(struct wfs_inode *dir_inode)
     fprintf(logfp, "Directory is full\n");
     fflush(logfp);
     return -1; // Directory is full (no more block slots)
-}
+}*/
 
 void add_dir_entry(int block_num, const char *filename, int inode_num)
 {
@@ -1131,7 +1264,7 @@ void add_dir_entry(int block_num, const char *filename, int inode_num)
     }
 }
 
-off_t get_block_number(struct wfs_inode *inode, int index)
+off_t get_block_num(struct wfs_inode *inode, int index)
 {
     if (index < 0)
         return -1;
@@ -1154,7 +1287,7 @@ off_t get_block_number(struct wfs_inode *inode, int index)
     return -1;
 }
 
-int set_block_number(struct wfs_inode *inode, int index, off_t block_num)
+int set_block_num(struct wfs_inode *inode, int index, off_t block_num)
 {
     if (index < 0)
         return -1;
