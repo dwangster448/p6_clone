@@ -342,7 +342,7 @@ void initialize_filesystem(FILE **disks, int num_disks, size_t num_inodes, size_
         .mtim = time(NULL), // Modification time
         .ctim = time(NULL), // Change time
     };
-    memset(root_inode.blocks, 0, sizeof(root_inode.blocks));
+    memset(root_inode.blocks, -1, sizeof(root_inode.blocks));
 
     // printf("Root inode initialization:\n");
     // printf("mode: %o, uid: %u, gid: %u, nlinks: %u\n", root_inode.mode, root_inode.uid, root_inode.gid, root_inode.nlinks);
@@ -437,6 +437,14 @@ void initialize_filesystem(FILE **disks, int num_disks, size_t num_inodes, size_
             perror("Failed to write root inode");
             exit(EXIT_FAILURE);
         }
+
+        // Add print statement here
+        printf("Disk %d initialized:\n", i);
+        printf("  Superblock written at offset 0.\n");
+        printf("  Inode bitmap starts at offset %zu.\n", superblock.i_bitmap_ptr);
+        printf("  Data bitmap starts at offset %zu.\n", superblock.d_bitmap_ptr);
+        printf("  Inodes start at offset %zu.\n", superblock.i_blocks_ptr);
+        printf("  Data blocks start at offset %zu.\n", superblock.d_blocks_ptr);
     }
 
     printf("Filesystem initialized successfully with RAID mode %d on %d disk(s).\n", raid_mode, num_disks);
@@ -452,10 +460,10 @@ int main(int argc, char *argv[])
     }
 
     // Debug: Print all arguments for checking
-    //printf("Debug: Received %d arguments:\n", argc);
+    // printf("Debug: Received %d arguments:\n", argc);
     for (int i = 0; i < argc; i++)
     {
-        //printf("  argv[%d]: %s\n", i, argv[i]);
+        // printf("  argv[%d]: %s\n", i, argv[i]);
     }
 
     // Parse and validate arguments
