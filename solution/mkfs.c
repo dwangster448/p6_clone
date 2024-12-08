@@ -94,10 +94,22 @@ int paramcheck(int argc, char *argv[])
                 print_usage(argv[0]);
                 return EXIT_FAILURE;
             }
-            raid_mode = atoi(argv[++i]);          // Set RAID mode from argument
-            if (raid_mode != 0 && raid_mode != 1) // Only support RAID 0 and RAID 1
+            const char *raid_mode_str = argv[++i];
+            if (strcmp(raid_mode_str, "0") == 0)
             {
-                fprintf(stderr, "Error: Unsupported RAID mode. Only RAID 0 and RAID 1 are supported.\n");
+                raid_mode = 0; // RAID 0
+            }
+            else if (strcmp(raid_mode_str, "1") == 0)
+            {
+                raid_mode = 1; // RAID 1
+            }
+            else if (strcmp(raid_mode_str, "1v") == 0)
+            {
+                raid_mode = 2; // Custom mapping for RAID 1v
+            }
+            else
+            {
+                fprintf(stderr, "Error: Unsupported RAID mode. Supported modes are 0, 1, and 1v.\n");
                 return EXIT_FAILURE;
             }
         }
